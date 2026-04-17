@@ -1,0 +1,6 @@
+bin/ 
+obj/ 
+wwwroot/FabricRepo/ 
+wwwroot/Exports/ 
+appsettings.json 
+appsettings.Development.json 

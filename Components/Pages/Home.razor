@@ -1,0 +1,391 @@
+﻿@page "/"
+@using System.IO
+@using ReportsAutomationApp.Models
+@using ReportsAutomationApp.Services
+@using Microsoft.AspNetCore.Components.Forms
+@using Microsoft.AspNetCore.Hosting
+@inject IConfiguration Config
+@inject ExtractionOrchestrator Orchestrator
+@inject IWebHostEnvironment Env
+
+<PageTitle>Reports Automation Dashboard</PageTitle>
+
+<div class="container-fluid mt-4">
+    <div class="d-flex justify-content-between align-items-center mb-4 pb-2" style="border-bottom: 2px solid #ddd;">
+        <h4 class="m-0">📑 Extractor Pipeline</h4>
+        
+        <button class="btn btn-dark fw-bold px-4" @onclick="ProcessAllSelected" disabled="@(!HasSelectedReports || isGlobalProcessing)">
+            @if (isGlobalProcessing)
+            {
+                <span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span>
+                <span> Processing Batch...</span>
+            }
+            else
+            {
+                <span>⚙️ Execute All Selected (@SelectedCount)</span>
+            }
+        </button>
+    </div>
+
+    @if (!string.IsNullOrEmpty(uiMessage))
+    {
+        <div class="alert alert-info alert-dismissible fade show">
+            @uiMessage
+            <button type="button" class="btn-close" @onclick="() => uiMessage = string.Empty"></button>
+        </div>
+    }
+
+    @if (reportGroups.Count == 0)
+    {
+        <div class="alert alert-warning">
+            <strong>No data found.</strong> Please click the "Sync Git" button or check your config path.
+        </div>
+    }
+    else
+    {
+        <div class="accordion" id="reportsAccordion">
+            @foreach (var group in reportGroups)
+            {
+                <div class="card mb-4 shadow-sm" style="border: 1px solid #49cc90; border-radius: 4px;">
+                    <div class="card-header d-flex justify-content-between align-items-center"
+                         style="background-color: rgba(73, 204, 144, 0.1); cursor: pointer;"
+                         @onclick="() => group.IsExpanded = !group.IsExpanded">
+                        
+                        <div class="d-flex align-items-center">
+                            <span class="badge bg-success me-3" style="font-size: 0.9rem;">Folder</span>
+                            <span class="fw-bold fs-5 text-dark">@group.GroupName</span>
+                            <span class="badge bg-secondary ms-3 rounded-pill">@group.Reports.Count reports</span>
+                        </div>
+                        <span class="text-muted fw-bold fs-5">
+                            @(group.IsExpanded ? "−" : "+")
+                        </span>
+                    </div>
+
+                    @if (group.IsExpanded)
+                    {
+                        <div class="list-group list-group-flush">
+                            @foreach (var report in group.Reports)
+                            {
+                                <div class="list-group-item d-flex align-items-center justify-content-between py-3" style="background-color: #fafafa;">
+                                    
+                                    <div class="d-flex align-items-center" style="width: 25%;">
+                                        <input class="form-check-input me-3" type="checkbox" @bind="report.IsSelected" style="width: 1.2rem; height: 1.2rem;" />
+                                        <span class="fw-bold text-dark" style="font-family: monospace; font-size: 1.1rem;">
+                                            📄 @report.ReportName
+                                        </span>
+                                    </div>
+
+                                    <div style="width: 25%;">
+                                        <select class="form-select form-select-sm" @bind="report.SelectedSemanticModelPath">
+                                            <option value="">-- Select Semantic Model --</option>
+                                            @foreach (var sm in semanticModels)
+                                            {
+                                                <option value="@sm.FullPath">@sm.Name</option>
+                                            }
+                                        </select>
+                                    </div>
+
+                                    <div class="d-flex gap-2 justify-content-center" style="width: 20%;">
+                                        @for (int i = 1; i <= 4; i++)
+                                        {
+                                            int stepNum = i;
+                                            bool isComplete = report.StepResults.ContainsKey(stepNum);
+                                            
+                                            <span class="badge @(GetBadgeClass(report.CompletedStep, stepNum)) rounded-circle p-2 shadow-sm"
+                                                  style="width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; cursor: @(isComplete ? "pointer" : "default");"
+                                                  title="@(isComplete ? "Click to view/edit data" : "")"
+                                                  @onclick="() => { if (isComplete) OpenModal(report, stepNum); }">
+                                                @stepNum
+                                            </span>
+                                        }
+                                    </div>
+
+                                    <div class="d-flex gap-2 justify-content-end" style="width: 30%;">
+                                        @if (report.IsProcessing)
+                                        {
+                                            <span class="spinner-border text-primary me-3" role="status"></span>
+                                        }
+                                        
+                                        <button class="btn btn-sm btn-outline-primary fw-bold"
+                                                @onclick="() => RunNextStep(report)"
+                                                disabled="@(report.CompletedStep >= 4 || report.IsProcessing || string.IsNullOrEmpty(report.SelectedSemanticModelPath))">
+                                            @(report.CompletedStep == 0 ? "Start (Step 1)" : $"Next (Step {report.CompletedStep + 1})")
+                                        </button>
+
+                                        <button class="btn btn-sm btn-success fw-bold"
+                                                @onclick="() => RunAllSteps(report)"
+                                                disabled="@(report.CompletedStep >= 4 || report.IsProcessing || string.IsNullOrEmpty(report.SelectedSemanticModelPath))">
+                                            Run All
+                                        </button>
+                                    </div>
+                                </div>
+                            }
+                        </div>
+                    }
+                </div>
+            }
+        </div>
+    }
+</div>
+
+@if (showModal && currentModalResult != null)
+{
+    <div class="modal fade show d-block" tabindex="-1" style="background-color: rgba(0,0,0,0.6);">
+        <div class="modal-dialog modal-xl modal-dialog-centered modal-dialog-scrollable">
+            <div class="modal-content border-0 shadow-lg">
+                <div class="modal-header bg-dark text-white">
+                    <h5 class="modal-title">🔍 Step @currentModalStep Results</h5>
+                    <button type="button" class="btn-close btn-close-white" @onclick="CloseModal"></button>
+                </div>
+                
+                <div class="modal-body bg-light">
+                    @if (!string.IsNullOrEmpty(currentModalResult.Message))
+                    {
+                        <div class="alert alert-success py-2">@currentModalResult.Message</div>
+                    }
+
+                    <h6 class="fw-bold text-secondary">Data Preview:</h6>
+                    <pre class="bg-white p-3 border rounded shadow-sm" style="font-size: 0.85rem; max-height: 400px; overflow-y: auto;">@currentModalResult.ExtractedDataPreview</pre>
+
+                    <hr class="my-4" />
+
+                    <div class="card border-primary shadow-sm">
+                        <div class="card-header bg-primary text-white py-2 fw-bold">
+                            ✏️ Manual Intervention (Replace File)
+                        </div>
+                        <div class="card-body">
+                            <p class="small text-muted mb-2">If you need to adjust the data before proceeding to the next step, download the file above, make your edits, and upload the updated version here. This will safely overwrite the existing data.</p>
+                            
+                            <div class="d-flex align-items-center gap-3">
+                                <InputFile OnChange="HandleFileUpload" class="form-control form-control-sm" style="max-width: 400px;" />
+                                @if (isUploading)
+                                {
+                                    <span class="spinner-border spinner-border-sm text-primary" role="status"></span>
+                                }
+                                @if (!string.IsNullOrEmpty(uploadMessage))
+                                {
+                                    <span class="fw-bold @(uploadMessage.Contains("❌") ? "text-danger" : "text-success")">
+                                        @uploadMessage
+                                    </span>
+                                }
+                            </div>
+                        </div>
+                    </div>
+
+                </div>
+                
+                <div class="modal-footer bg-white">
+                    @if (!string.IsNullOrEmpty(currentModalResult.DownloadFilePath))
+                    {
+                        <a href="@currentModalResult.DownloadFilePath" download target="_blank" class="btn btn-outline-primary fw-bold me-auto">
+                            ⬇️ Download Original File
+                        </a>
+                    }
+                    <button type="button" class="btn btn-secondary fw-bold" @onclick="CloseModal">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    private Dictionary<string, StepResult> step2ModelCache = new();
+    private List<ReportGroupUI> reportGroups = new();
+    private List<SemanticModelUI> semanticModels = new();
+    private bool isGlobalProcessing = false;
+    private string uiMessage = "";
+
+    // --- Modal State Variables ---
+    private bool showModal = false;
+    private int currentModalStep = 0;
+    private StepResult currentModalResult;
+    private string uploadMessage = "";
+    private bool isUploading = false;
+
+    private int SelectedCount => reportGroups.SelectMany(g => g.Reports).Count(r => r.IsSelected);
+    private bool HasSelectedReports => SelectedCount > 0;
+
+    protected override void OnInitialized()
+    {
+        LoadDirectoryStructure();
+    }
+
+    private void LoadDirectoryStructure()
+    {
+        reportGroups.Clear();
+        semanticModels.Clear();
+
+        string relativePath = Config["FabricSettings:ArtifactsRelativePath"];
+        if (string.IsNullOrEmpty(relativePath)) return;
+
+        string artifactsBaseDir = Path.Combine(Env.WebRootPath, relativePath);
+        string reportsDir = Path.Combine(artifactsBaseDir, "Reports");
+        string semanticModelsDir = Path.Combine(artifactsBaseDir, "Semantic Models");
+
+        if (Directory.Exists(semanticModelsDir))
+        {
+            var smDirs = Directory.GetDirectories(semanticModelsDir);
+            foreach (var smPath in smDirs)
+            {
+                semanticModels.Add(new SemanticModelUI { Name = Path.GetFileName(smPath), FullPath = smPath });
+            }
+        }
+
+        if (Directory.Exists(reportsDir))
+        {
+            var groupFolders = Directory.GetDirectories(reportsDir);
+            foreach (var groupFolder in groupFolders)
+            {
+                var groupUI = new ReportGroupUI { GroupName = Path.GetFileName(groupFolder), IsExpanded = false };
+                var actualReportFolders = Directory.GetDirectories(groupFolder);
+                
+                foreach (var repPath in actualReportFolders)
+                {
+                    groupUI.Reports.Add(new ReportUI
+                    {
+                        ReportName = Path.GetFileName(repPath),
+                        ReportFullPath = repPath,
+                        IsSelected = false
+                    });
+                }
+
+                if (groupUI.Reports.Any()) reportGroups.Add(groupUI);
+            }
+        }
+    }
+
+    private async Task RunNextStep(ReportUI report)
+    {
+        if (string.IsNullOrEmpty(report.SelectedSemanticModelPath) || report.CompletedStep >= 4) return;
+
+        report.IsProcessing = true;
+        int nextStepToRun = report.CompletedStep + 1;
+        StateHasChanged();
+
+        StepResult result;
+
+        if (nextStepToRun == 2 && step2ModelCache.ContainsKey(report.SelectedSemanticModelPath))
+        {
+            result = step2ModelCache[report.SelectedSemanticModelPath];
+            result = new StepResult
+            {
+                IsSuccess = result.IsSuccess,
+                Message = "⚡ Skipped: Model already extracted in a previous report.",
+                DownloadFilePath = result.DownloadFilePath,
+                ExtractedDataPreview = result.ExtractedDataPreview
+            };
+            await Task.Delay(200);
+        }
+        else
+        {
+            result = await Orchestrator.ExecuteProcessAsync(report.ReportFullPath, report.SelectedSemanticModelPath, nextStepToRun);
+
+            if (nextStepToRun == 2 && result.IsSuccess)
+            {
+                step2ModelCache[report.SelectedSemanticModelPath] = result;
+            }
+        }
+
+        report.StepResults[nextStepToRun] = result;
+        if (result.IsSuccess)
+        {
+            report.CompletedStep = nextStepToRun;
+        }
+
+        report.IsProcessing = false;
+        StateHasChanged();
+    }
+
+    private async Task RunAllSteps(ReportUI report)
+    {
+        if (string.IsNullOrEmpty(report.SelectedSemanticModelPath)) return;
+
+        while (report.CompletedStep < 4)
+        {
+            int stepAttempted = report.CompletedStep + 1;
+            await RunNextStep(report);
+            if (!report.StepResults[stepAttempted].IsSuccess) break;
+        }
+    }
+
+    private async Task ProcessAllSelected()
+    {
+        isGlobalProcessing = true;
+        uiMessage = $"Starting batch process for {SelectedCount} reports...";
+        StateHasChanged();
+
+        var selectedReports = reportGroups.SelectMany(g => g.Reports).Where(r => r.IsSelected).ToList();
+        
+        foreach (var report in selectedReports)
+        {
+            await RunAllSteps(report);
+            report.IsSelected = false;
+        }
+
+        uiMessage = $"✅ Batch processing complete! Shared models were intelligently cached and skipped.";
+        isGlobalProcessing = false;
+        StateHasChanged();
+    }
+
+    private string GetBadgeClass(int completedStep, int badgeStep)
+    {
+        if (completedStep >= badgeStep) return "bg-success";
+        if (completedStep + 1 == badgeStep) return "bg-primary text-white shadow";
+        return "bg-secondary text-white opacity-50";
+    }
+
+    // --- Modal & Upload Logic ---
+
+    private void OpenModal(ReportUI report, int stepNum)
+    {
+        if (report.StepResults.ContainsKey(stepNum))
+        {
+            currentModalResult = report.StepResults[stepNum];
+            currentModalStep = stepNum;
+            uploadMessage = "";
+            showModal = true;
+        }
+    }
+
+    private void CloseModal()
+    {
+        showModal = false;
+        currentModalResult = null;
+    }
+
+    private async Task HandleFileUpload(InputFileChangeEventArgs e)
+    {
+        if (currentModalResult == null || string.IsNullOrEmpty(currentModalResult.DownloadFilePath)) return;
+
+        try
+        {
+            isUploading = true;
+            uploadMessage = "";
+            StateHasChanged();
+
+            var file = e.File;
+            
+            // Map the web URL (e.g., /Exports/File.csv) to the actual physical server path
+            string relativePath = currentModalResult.DownloadFilePath.TrimStart('/');
+            string physicalPath = Path.Combine(Env.WebRootPath, relativePath.Replace('/', Path.DirectorySeparatorChar));
+
+            // Overwrite the existing file
+            await using FileStream fs = new FileStream(physicalPath, FileMode.Create);
+            await file.OpenReadStream(maxAllowedSize: 20 * 1024 * 1024).CopyToAsync(fs); // Max 20MB
+
+            uploadMessage = $"✅ File overridden successfully!";
+            
+            // Update the preview text so the user knows their override worked
+            currentModalResult.ExtractedDataPreview = "⚠️ [DATA MANUALLY OVERRIDDEN BY USER]\n\n" + currentModalResult.ExtractedDataPreview;
+        }
+        catch (Exception ex)
+        {
+            uploadMessage = $"❌ Upload failed: {ex.Message}";
+        }
+        finally
+        {
+            isUploading = false;
+            StateHasChanged();
+        }
+    }
+}

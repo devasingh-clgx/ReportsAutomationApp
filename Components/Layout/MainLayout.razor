@@ -1,0 +1,218 @@
+﻿@inherits LayoutComponentBase
+@using LibGit2Sharp
+@using System.IO
+@using System.Diagnostics
+@using Microsoft.AspNetCore.Hosting
+@inject IConfiguration Config
+@inject NavigationManager NavManager
+@inject IWebHostEnvironment Env
+
+<div class="page">
+    <main>
+        <div class="top-row px-4" style="background-color: #1b1b1b; color: white; display: flex; justify-content: space-between; align-items: center; border-bottom: 4px solid #89bf04;">
+            <h3 style="margin: 0; font-weight: bold;">📊 Reports Automation App</h3>
+            
+            <div class="d-flex gap-2">
+                <button class="btn btn-outline-light" @onclick='() => NavManager.NavigateTo("/snowflake-lab")'>❄ Snowflake Lab</button>
+                <button class="btn btn-success" @onclick="SyncGitRepo" disabled="@isSyncing">
+                    @if (isSyncing)
+                    {
+                        <span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span>
+                        <span> Syncing...</span>
+                    }
+                    else
+                    {
+                        <span>🔄 Sync Git</span>
+                    }
+                </button>
+            </div>
+        </div>
+
+        @if (!string.IsNullOrEmpty(statusMessage))
+        {
+            <div class="alert @(isError ? "alert-danger" : "alert-success") m-3 alert-dismissible fade show" role="alert">
+                @statusMessage
+                <button type="button" class="btn-close" @onclick="ClearMessage" aria-label="Close"></button>
+            </div>
+        }
+
+        <article class="content px-4 py-4">
+            @Body
+        </article>
+    </main>
+</div>
+
+@code {
+    private bool isSyncing = false;
+    private string statusMessage = "";
+    private bool isError = false;
+
+    private string targetFolderPath = "";
+
+    protected override void OnInitialized()
+    {
+        // Dynamically point to the wwwroot/FabricRepo folder
+        targetFolderPath = Path.Combine(Env.WebRootPath, "FabricRepo");
+    }
+
+    private async Task SyncGitRepo()
+    {
+        isSyncing = true;
+        ShowMessage("Starting sync...", false);
+        StateHasChanged();
+        
+        // Run git operations on a background thread so the UI doesn't freeze
+        await Task.Run(() => PerformGitSync());
+
+        isSyncing = false;
+        StateHasChanged();
+    }
+
+    private void PerformGitSync()
+    {
+        try
+        {
+            string repoUrl = Config["GitSettings:RepositoryUrl"];
+            string patToken = Config["GitSettings:PersonalAccessToken"];
+
+            if (string.IsNullOrEmpty(repoUrl) || string.IsNullOrEmpty(patToken))
+            {
+                ShowMessage("❌ Error: RepositoryUrl or PersonalAccessToken is missing from appsettings.json.", true);
+                return;
+            }
+
+            var cloneOptions = new CloneOptions();
+            cloneOptions.FetchOptions.CredentialsProvider = (url, usernameFromUrl, types) =>
+                new UsernamePasswordCredentials
+                {
+                    Username = "PAT",
+                    Password = patToken
+                };
+            
+            // If the folder exists, but it's a corrupted/failed clone, wipe it out.
+            if (Directory.Exists(targetFolderPath) && !Repository.IsValid(targetFolderPath))
+            {
+                ShowMessage("Cleaning up previous failed sync...", false);
+                DeleteDirectory(targetFolderPath);
+            }
+
+            if (!Directory.Exists(targetFolderPath))
+            {
+                Directory.CreateDirectory(targetFolderPath);
+            }
+
+            if (Repository.IsValid(targetFolderPath))
+            {
+                ShowMessage("Repository found locally. Pulling latest changes...", false);
+            
+                using (var repo = new Repository(targetFolderPath))
+                {
+                    var pullOptions = new PullOptions
+                    {
+                        FetchOptions = new FetchOptions()
+                    };
+                    pullOptions.FetchOptions.CredentialsProvider = (url, usernameFromUrl, types) =>
+                        new UsernamePasswordCredentials
+                        {
+                            Username = "PAT",
+                            Password = patToken
+                        };
+
+                    var signature = new Signature("ReportsAutomation", "auto@automation.com", DateTimeOffset.Now);
+                    Commands.Pull(repo, signature, pullOptions);
+                }
+            
+                ShowMessage("✅ Repository Pull Complete! Latest files are ready.", false);
+            }
+            else
+            {
+                ShowMessage("Cloning repository (Attempt 1: LibGit2Sharp)...", false);
+            
+                try
+                {
+                    Repository.Clone(repoUrl, targetFolderPath, cloneOptions);
+                    ShowMessage("✅ Repository Clone Complete! Files are ready.", false);
+                }
+                catch (Exception ex)
+                {
+                    ShowMessage($"LibGit2Sharp failed. Attempting Native Git fallback...", false);
+                    
+                    // Clean up the broken folder from the first attempt
+                    DeleteDirectory(targetFolderPath);
+                    Directory.CreateDirectory(targetFolderPath);
+                    
+                    // Dynamically inject PAT into the URL: https://PAT:token@nextgear.visualstudio...
+                    var uri = new Uri(repoUrl);
+                    string authUrl = $"{uri.Scheme}://PAT:{patToken}@{uri.Host}{uri.PathAndQuery}";
+                    
+                    // Run hidden CMD process
+                    var processInfo = new ProcessStartInfo
+                    {
+                        FileName = "cmd.exe",
+                        Arguments = $"/c git clone \"{authUrl}\" \"{targetFolderPath}\" --config core.longpaths=true",
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        UseShellExecute = false,
+                        CreateNoWindow = true
+                    };
+
+                    using var process = Process.Start(processInfo);
+                    process.WaitForExit();
+
+                    if (process.ExitCode != 0)
+                    {
+                        string errorOutput = process.StandardError.ReadToEnd();
+                        throw new Exception($"Native Git failed. Please ensure Git is installed on the desktop. Details: {errorOutput}");
+                    }
+
+                    ShowMessage("✅ Repository Clone Complete via Native Git!", false);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            ShowMessage($"❌ Git Error: {ex.Message}", true);
+        }
+    }
+    
+    private void ShowMessage(string message, bool error)
+    {
+        statusMessage = message;
+        isError = error;
+        InvokeAsync(StateHasChanged);
+    }
+
+    private void ClearMessage()
+    {
+        statusMessage = "";
+        StateHasChanged();
+    }
+    
+    // Recursively delete a directory and ensure read-only attributes don't block deletion
+    private void DeleteDirectory(string path)
+    {
+        if (string.IsNullOrEmpty(path) || !Directory.Exists(path)) return;
+
+        try
+        {
+            // Remove read-only attribute from all files and directories
+            foreach (var dir in Directory.GetDirectories(path, "*", SearchOption.AllDirectories))
+            {
+                try { File.SetAttributes(dir, FileAttributes.Normal); } catch { }
+            }
+
+            foreach (var file in Directory.GetFiles(path, "*", SearchOption.AllDirectories))
+            {
+                try { File.SetAttributes(file, FileAttributes.Normal); } catch { }
+            }
+            
+            // Finally delete recursively
+            Directory.Delete(path, recursive: true);
+        }
+        catch (Exception ex)
+        {
+            // Rethrow as IOException with context so callers can log / display useful info
+            throw new IOException($"Failed to delete directory '{path}': {ex.Message}", ex);
+        }
+    }
+}

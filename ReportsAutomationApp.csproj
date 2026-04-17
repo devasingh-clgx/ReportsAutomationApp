@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <BlazorDisableThrowNavigationException>true</BlazorDisableThrowNavigationException>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="LibGit2Sharp" Version="0.31.0" />
+    <PackageReference Include="Snowflake.Data" Version="5.5.0" />
+  </ItemGroup>
+	<ItemGroup>
+		<Content Remove="wwwroot\FabricRepo\**" />
+		<Content Remove="wwwroot\Exports\**" />
+		<None Remove="wwwroot\FabricRepo\**" />
+		<None Remove="wwwroot\Exports\**" />
+	</ItemGroup>
+</Project>
