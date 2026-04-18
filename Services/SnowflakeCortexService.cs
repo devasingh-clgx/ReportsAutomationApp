@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Data;
+using System.Collections.ObjectModel;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -14,9 +15,20 @@ namespace ReportsAutomationApp.Services
 {
     public class SnowflakeCortexService : IExtractionStep
     {
+        private const int LakehouseSqlColumnIndex = 10;
+        private const int MinimumColumnCount = 11;
+        private const int DefaultCortexBatchSize = 5;
+        private const int MaxCortexBatchSize = 20;
+        private static readonly IReadOnlyDictionary<string, string> DefaultModelAliases =
+            new ReadOnlyDictionary<string, string>(new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["Claude Opus 4.6"] = "claude-4-opus",
+                ["Claude Sonnet 4.6"] = "claude-4-sonnet",
+                ["OpenAI GPT 5.4"] = "openai-gpt-4.1"
+            });
+
         private readonly IWebHostEnvironment _env;
         private readonly IConfiguration _config;
-        private static readonly SemaphoreSlim _authLock = new SemaphoreSlim(1, 1);
         public SnowflakeCortexService(IWebHostEnvironment env, IConfiguration config)
         {
             _env = env;
@@ -55,69 +67,69 @@ namespace ReportsAutomationApp.Services
                     return new StepResult { IsSuccess = false, Message = "Snowflake Connection String missing in appsettings.json." };
 
                 int processedCount = 0;
+                string cortexModel = ResolveCortexModel();
+                int batchSize = GetCortexBatchSize();
+                var finalSqlByRowIndex = new Dictionary<int, string>();
+                var requestsBySql = new Dictionary<string, CortexRequest>(StringComparer.Ordinal);
 
-                // 3. Connect to Snowflake and process row-by-row
-                using (var conn = new SnowflakeDbConnection())
+                for (int i = 1; i < csvRows.Count; i++)
                 {
-                    conn.ConnectionString = connString;
-                    await OpenSnowflakeConnectionAsync(conn, connString);
+                    var row = csvRows[i];
+                    if (row.Count < MinimumColumnCount) continue;
 
-                    for (int i = 1; i < csvRows.Count; i++)
+                    string lakehouseSql = row[LakehouseSqlColumnIndex];
+
+                    if (RequiresNoSnowflakeSql(lakehouseSql))
                     {
-                        var row = csvRows[i];
-                        if (row.Count < 11) continue;
+                        finalSqlByRowIndex[i] = "No SQL Needed";
+                        continue;
+                    }
 
-                        // The Lakehouse SQL is the last column from Step 3
-                        string lakehouseSql = row[10];
+                    if (requestsBySql.TryGetValue(lakehouseSql, out var existingRequest))
+                    {
+                        existingRequest.RowIndexes.Add(i);
+                        continue;
+                    }
 
-                        // Skip if no SQL was generated
-                        if (string.IsNullOrWhiteSpace(lakehouseSql) || lakehouseSql.Contains("No DAX Formulas"))
+                    requestsBySql.Add(lakehouseSql, new CortexRequest(lakehouseSql, BuildPrompt(lakehouseSql), i));
+                }
+
+                if (requestsBySql.Count > 0)
+                {
+                    using var conn = new SnowflakeDbConnection();
+                    conn.ConnectionString = connString;
+                    await conn.OpenAsync();
+
+                    foreach (var batch in requestsBySql.Values.Chunk(batchSize))
+                    {
+                        var batchList = batch.ToList();
+                        var batchResults = await ExecuteCortexBatchAsync(conn, batchList, cortexModel);
+
+                        for (int index = 0; index < batchList.Count; index++)
                         {
-                            var skippedRow = new List<string>(row) { "No SQL Needed" };
-                            outputCsv.AppendLine(string.Join(",", skippedRow.Select(c => $"\"{c?.Replace("\"", "\"\"") ?? ""}\"")));
-                            continue;
-                        }
+                            var request = batchList[index];
+                            string finalSnowflakeSql = batchResults[index];
 
-                        // Create the Cortex Prompt exactly as you designed
-                        string prompt = $@"
-You are an expert Snowflake Data Engineer.
-Your task is to take the provided generic Lakehouse SQL and convert it into highly optimized Snowflake SQL.
-
-RULES:
-1. Replace all generic schemas (like [CWS] or [dbo]) with the target schema: QA_EDW.VIEWS.
-2. Ensure table and column names do not use SQL Server brackets [ ]. Use Snowflake double quotes """" ONLY if the name contains spaces or special characters, otherwise leave them unquoted.
-3. Ensure all functions (like ISNULL, COALESCE, DATE math) use native Snowflake syntax.
-4. Output ONLY the raw Snowflake SQL query. Do not include markdown formatting or explanations.
-
-### LAKEHOUSE SQL TO CONVERT:
-{lakehouseSql}
-";
-                        // Escape single quotes to prevent SQL injection in the Cortex command
-                        string safePrompt = prompt.Replace("'", "''");
-
-                        // We use mistral-large2 (or your preferred model) via Cortex
-                        string cortexQuery = $"SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', '{safePrompt}') AS LLM_RESPONSE";
-
-                        string finalSnowflakeSql = "";
-
-                        using (var cmd = conn.CreateCommand())
-                        {
-                            cmd.CommandText = cortexQuery;
-                            using (var reader = await cmd.ExecuteReaderAsync())
+                            foreach (int rowIndex in request.RowIndexes)
                             {
-                                if (await reader.ReadAsync())
-                                {
-                                    finalSnowflakeSql = reader.GetString(0);
-                                    // Clean up markdown just in case
-                                    finalSnowflakeSql = finalSnowflakeSql.Replace("```sql", "").Replace("```", "").Trim();
-                                }
+                                finalSqlByRowIndex[rowIndex] = finalSnowflakeSql;
+                                processedCount++;
                             }
                         }
-
-                        var newRow = new List<string>(row) { finalSnowflakeSql };
-                        outputCsv.AppendLine(string.Join(",", newRow.Select(c => $"\"{c?.Replace("\"", "\"\"") ?? ""}\"")));
-                        processedCount++;
                     }
+                }
+
+                for (int i = 1; i < csvRows.Count; i++)
+                {
+                    var row = csvRows[i];
+                    if (row.Count < MinimumColumnCount) continue;
+
+                    var newRow = new List<string>(row)
+                    {
+                        finalSqlByRowIndex.TryGetValue(i, out var finalSnowflakeSql) ? finalSnowflakeSql : string.Empty
+                    };
+
+                    outputCsv.AppendLine(string.Join(",", newRow.Select(c => $"\"{c?.Replace("\"", "\"\"") ?? ""}\"")));
                 }
 
                 // 4. Save the Final Step 4 Output
@@ -128,7 +140,7 @@ RULES:
                 return new StepResult
                 {
                     IsSuccess = true,
-                    Message = $"Successfully optimized {processedCount} queries using Snowflake Cortex.",
+                    Message = $"Successfully optimized {processedCount} queries using Snowflake Cortex with {requestsBySql.Count} unique prompt(s).",
                     DownloadFilePath = $"/Exports/{outFileName}",
                     ExtractedDataPreview = outputCsv.ToString().Substring(0, Math.Min(outputCsv.Length, 1000)) + "...\n[Data Truncated]"
                 };
@@ -139,31 +151,118 @@ RULES:
             }
         }
 
-        private async Task OpenSnowflakeConnectionAsync(SnowflakeDbConnection conn, string connectionString)
+        private async Task<List<string>> ExecuteCortexBatchAsync(SnowflakeDbConnection conn, IReadOnlyList<CortexRequest> batch, string modelName)
         {
-            // External browser auth is interactive and can break when many runs happen at once.
-            // Serialize only that mode; keep password/key/OAuth modes fully concurrent.
-            if (UsesInteractiveAuthenticator(connectionString))
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = BuildCortexBatchQuery(batch, modelName);
+
+            var results = Enumerable.Repeat(string.Empty, batch.Count).ToArray();
+
+            using var reader = await cmd.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
             {
-                await _authLock.WaitAsync();
-                try
+                int sequence = Convert.ToInt32(reader.GetValue(0), CultureInfo.InvariantCulture);
+                if (sequence < 0 || sequence >= results.Length)
                 {
-                    await conn.OpenAsync();
-                }
-                finally
-                {
-                    _authLock.Release();
+                    continue;
                 }
 
-                return;
+                results[sequence] = reader.IsDBNull(1)
+                    ? string.Empty
+                    : CleanCortexResponse(reader.GetString(1));
             }
 
-            await conn.OpenAsync();
+            return results.ToList();
         }
 
-        private static bool UsesInteractiveAuthenticator(string connectionString)
+        private static string BuildCortexBatchQuery(IReadOnlyList<CortexRequest> batch, string modelName)
         {
-            return connectionString.Contains("authenticator=externalbrowser", StringComparison.OrdinalIgnoreCase);
+            var values = string.Join(",", batch.Select((request, index) =>
+                $"({index}, '{EscapeSqlLiteral(request.Prompt)}')"));
+
+            return $@"
+SELECT batch.seq,
+       SNOWFLAKE.CORTEX.COMPLETE('{EscapeSqlLiteral(modelName)}', batch.prompt) AS LLM_RESPONSE
+FROM (
+    SELECT COLUMN1 AS seq, COLUMN2 AS prompt
+    FROM VALUES {values}
+) AS batch
+ORDER BY batch.seq";
+        }
+
+        private int GetCortexBatchSize()
+        {
+            int configuredBatchSize = _config.GetValue<int?>("Snowflake:CortexBatchSize") ?? DefaultCortexBatchSize;
+            return Math.Clamp(configuredBatchSize, 1, MaxCortexBatchSize);
+        }
+
+        private string ResolveCortexModel()
+        {
+            string? configuredModel = _config["Snowflake:CortexModel"];
+            if (string.IsNullOrWhiteSpace(configuredModel))
+            {
+                throw new InvalidOperationException("Snowflake:CortexModel is missing in appsettings.json.");
+            }
+
+            string selectedModel = configuredModel.Trim();
+
+            string? configuredAliasModel = _config[$"Snowflake:CortexModels:{selectedModel}"];
+            if (!string.IsNullOrWhiteSpace(configuredAliasModel))
+            {
+                return configuredAliasModel.Trim();
+            }
+
+            if (DefaultModelAliases.TryGetValue(selectedModel, out string? mappedModel))
+            {
+                return mappedModel;
+            }
+
+            if (selectedModel.Contains('-', StringComparison.Ordinal))
+            {
+                return selectedModel;
+            }
+
+            throw new InvalidOperationException($"Snowflake:CortexModel '{selectedModel}' is not mapped to a valid Snowflake Cortex model. Configure Snowflake:CortexModels:{selectedModel} in appsettings.json.");
+        }
+
+        private static bool RequiresNoSnowflakeSql(string lakehouseSql)
+        {
+            return string.IsNullOrWhiteSpace(lakehouseSql)
+                || lakehouseSql.Contains("No DAX Formulas", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string BuildPrompt(string lakehouseSql, string schemaMetadata = "")
+        {
+            return $@"You are an Expert Snowflake Database Administrator and SQL Optimizer.
+Your task is to translate the provided generic/Lakehouse SQL into perfectly formatted, production-ready Snowflake SQL.
+
+### STRICT COMPILER RULES:
+1. TARGET SCHEMA: You MUST map all tables to the ""QA_EDW"".""VIEWS"" schema.
+2. IDENTIFIERS: You MUST enclose all database, schema, table, and column names in double quotes ("""") if they contain spaces, special characters, or are case-sensitive. NEVER use SQL Server brackets [ ].
+   - Example Bad: [QA_EDW].[VIEWS].[My Table]
+   - Example Good: ""QA_EDW"".""VIEWS"".""My Table""
+3. DIALECT PERFECTION: Ensure all functions are native to Snowflake. 
+   - Replace ISNULL with NVL or COALESCE.
+   - Replace standard string concatenations with CONCAT() or ||.
+   - Ensure explicit CAST() or :: operations where data types might clash.
+4. TABLE/COLUMN ALIGNMENT: If the Lakehouse SQL references a column or table that looks slightly off, use your best judgment to align it to standard dimensional modeling naming conventions.
+5. NO CHATTER: Output ONLY the raw SQL query. Do not include markdown (```sql), explanations, or trailing comments.
+
+### LAKEHOUSE SQL TO CONVERT:
+{lakehouseSql}
+";
+        }
+
+        private static string CleanCortexResponse(string response)
+        {
+            return response.Replace("```sql", "", StringComparison.OrdinalIgnoreCase)
+                .Replace("```", string.Empty, StringComparison.Ordinal)
+                .Trim();
+        }
+
+        private static string EscapeSqlLiteral(string value)
+        {
+            return value.Replace("'", "''");
         }
 
         private string ResolveSnowflakeConnectionString()
@@ -196,9 +295,23 @@ RULES:
             return string.Join(";", pairs);
         }
 
-        private static string BuildPair(string key, string value)
+        private static string BuildPair(string key, string? value)
         {
             return string.IsNullOrWhiteSpace(value) ? string.Empty : $"{key}={value}";
+        }
+
+        private sealed class CortexRequest
+        {
+            public CortexRequest(string lakehouseSql, string prompt, int rowIndex)
+            {
+                LakehouseSql = lakehouseSql;
+                Prompt = prompt;
+                RowIndexes = new List<int> { rowIndex };
+            }
+
+            public string LakehouseSql { get; }
+            public string Prompt { get; }
+            public List<int> RowIndexes { get; }
         }
 
         // Re-use the exact same robust CSV parser from Step 3

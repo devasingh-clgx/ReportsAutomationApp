@@ -2,7 +2,10 @@
 @using LibGit2Sharp
 @using System.IO
 @using System.Diagnostics
+@using System.Text
 @using Microsoft.AspNetCore.Hosting
+@using Snowflake.Data.Client
+@using System.Data
 @inject IConfiguration Config
 @inject NavigationManager NavManager
 @inject IWebHostEnvironment Env
@@ -14,15 +17,15 @@
             
             <div class="d-flex gap-2">
                 <button class="btn btn-outline-light" @onclick='() => NavManager.NavigateTo("/snowflake-lab")'>❄ Snowflake Lab</button>
-                <button class="btn btn-success" @onclick="SyncGitRepo" disabled="@isSyncing">
+                <button class="btn btn-success" @onclick="SyncAll" disabled="@isSyncing">
                     @if (isSyncing)
                     {
                         <span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span>
-                        <span> Syncing...</span>
+                        <span> Syncing Environments...</span>
                     }
                     else
                     {
-                        <span>🔄 Sync Git</span>
+                        <span>🔄 Sync (Git & Schema)</span>
                     }
                 </button>
             </div>
@@ -55,14 +58,30 @@
         targetFolderPath = Path.Combine(Env.WebRootPath, "FabricRepo");
     }
 
-    private async Task SyncGitRepo()
+    private async Task SyncAll()
     {
         isSyncing = true;
-        ShowMessage("Starting sync...", false);
+        isError = false;
+        
+        ShowMessage("Starting full environment sync (Git & Snowflake)...", false);
         StateHasChanged();
         
-        // Run git operations on a background thread so the UI doesn't freeze
-        await Task.Run(() => PerformGitSync());
+        // Run heavy operations on a background thread
+        await Task.Run(() =>
+        {
+            PerformGitSync();
+            
+            // Only proceed to Snowflake sync if Git sync didn't fatally crash
+            if (!isError)
+            {
+                PerformSnowflakeSchemaSync();
+            }
+        });
+
+        if (!isError)
+        {
+            ShowMessage("✅ All environments (Git & Snowflake Schema) synced successfully!", false);
+        }
 
         isSyncing = false;
         StateHasChanged();
@@ -81,18 +100,10 @@
                 return;
             }
 
-            var cloneOptions = new CloneOptions();
-            cloneOptions.FetchOptions.CredentialsProvider = (url, usernameFromUrl, types) =>
-                new UsernamePasswordCredentials
-                {
-                    Username = "PAT",
-                    Password = patToken
-                };
-            
-            // If the folder exists, but it's a corrupted/failed clone, wipe it out.
+            var credentials = new UsernamePasswordCredentials { Username = "PAT", Password = patToken };
+
             if (Directory.Exists(targetFolderPath) && !Repository.IsValid(targetFolderPath))
             {
-                ShowMessage("Cleaning up previous failed sync...", false);
                 DeleteDirectory(targetFolderPath);
             }
 
@@ -103,75 +114,141 @@
 
             if (Repository.IsValid(targetFolderPath))
             {
-                ShowMessage("Repository found locally. Pulling latest changes...", false);
-            
+                // --- PULL OPERATION (Repo exists) ---
                 using (var repo = new Repository(targetFolderPath))
                 {
+                    // Enforce long paths locally BEFORE pulling
+                    repo.Config.Set("core.longpaths", true);
+
                     var pullOptions = new PullOptions
                     {
-                        FetchOptions = new FetchOptions()
-                    };
-                    pullOptions.FetchOptions.CredentialsProvider = (url, usernameFromUrl, types) =>
-                        new UsernamePasswordCredentials
+                        FetchOptions = new FetchOptions
                         {
-                            Username = "PAT",
-                            Password = patToken
-                        };
+                            CredentialsProvider = (url, usernameFromUrl, types) => credentials
+                        }
+                    };
 
                     var signature = new Signature("ReportsAutomation", "auto@automation.com", DateTimeOffset.Now);
                     Commands.Pull(repo, signature, pullOptions);
                 }
-            
-                ShowMessage("✅ Repository Pull Complete! Latest files are ready.", false);
             }
             else
             {
-                ShowMessage("Cloning repository (Attempt 1: LibGit2Sharp)...", false);
-            
+                // --- CLONE OPERATION (Repo does not exist) ---
+                var cloneOptions = new CloneOptions
+                {
+                    FetchOptions = { CredentialsProvider = (url, usernameFromUrl, types) => credentials }
+                };
+
                 try
                 {
+                    // Attempt native LibGit2Sharp Clone first
                     Repository.Clone(repoUrl, targetFolderPath, cloneOptions);
-                    ShowMessage("✅ Repository Clone Complete! Files are ready.", false);
                 }
-                catch (Exception ex)
+                catch (Exception)
                 {
-                    ShowMessage($"LibGit2Sharp failed. Attempting Native Git fallback...", false);
-                    
-                    // Clean up the broken folder from the first attempt
+                    // Fallback to native cmd.exe with forced longpaths if LibGit2Sharp crashes
                     DeleteDirectory(targetFolderPath);
                     Directory.CreateDirectory(targetFolderPath);
+                    string basicAuthHeader = Convert.ToBase64String(Encoding.ASCII.GetBytes($"PAT:{patToken}"));
                     
-                    // Dynamically inject PAT into the URL: https://PAT:token@nextgear.visualstudio...
-                    var uri = new Uri(repoUrl);
-                    string authUrl = $"{uri.Scheme}://PAT:{patToken}@{uri.Host}{uri.PathAndQuery}";
-                    
-                    // Run hidden CMD process
                     var processInfo = new ProcessStartInfo
                     {
                         FileName = "cmd.exe",
-                        Arguments = $"/c git clone \"{authUrl}\" \"{targetFolderPath}\" --config core.longpaths=true",
-                        RedirectStandardOutput = true,
+                        Arguments = $"/c git -c core.longpaths=true -c http.extraheader=\"AUTHORIZATION: basic {basicAuthHeader}\" clone \"{repoUrl}\" \"{targetFolderPath}\"",
                         RedirectStandardError = true,
                         UseShellExecute = false,
                         CreateNoWindow = true
                     };
 
                     using var process = Process.Start(processInfo);
+                    if (process == null)
+                    {
+                        throw new Exception("Native Git fallback failed to start.");
+                    }
+
+                    string errorOutput = process.StandardError.ReadToEnd();
                     process.WaitForExit();
 
                     if (process.ExitCode != 0)
                     {
-                        string errorOutput = process.StandardError.ReadToEnd();
-                        throw new Exception($"Native Git failed. Please ensure Git is installed on the desktop. Details: {errorOutput}");
+                        throw new Exception($"Native Git fallback failed. Details: {errorOutput}");
                     }
+                }
 
-                    ShowMessage("✅ Repository Clone Complete via Native Git!", false);
+                // Regardless of which clone method succeeded, permanently stamp the config into the local repo!
+                using (var repo = new Repository(targetFolderPath))
+                {
+                    repo.Config.Set("core.longpaths", true);
                 }
             }
         }
         catch (Exception ex)
         {
             ShowMessage($"❌ Git Error: {ex.Message}", true);
+        }
+    }
+    private void PerformSnowflakeSchemaSync()
+    {
+        try
+        {
+            InvokeAsync(() => ShowMessage("Git complete. Fetching Snowflake Schema...", false));
+
+            string connString = Config["Snowflake:ConnectionString"];
+            if (string.IsNullOrEmpty(connString))
+            {
+                // Fallback builder if main ConnectionString is missing
+                connString = $"account={Config["Snowflake:Account"]};user={Config["Snowflake:User"]};password={Config["Snowflake:Password"]};db={Config["Snowflake:Database"]};schema={Config["Snowflake:Schema"]};warehouse={Config["Snowflake:Warehouse"]};role={Config["Snowflake:Role"]}";
+            }
+
+            using var conn = new SnowflakeDbConnection();
+            conn.ConnectionString = connString;
+            conn.Open();
+
+            using var cmd = conn.CreateCommand();
+            // Fetching ONLY from the VIEWS schema as you specified earlier
+            cmd.CommandText = @"
+                SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE 
+                FROM INFORMATION_SCHEMA.COLUMNS 
+                WHERE TABLE_SCHEMA = 'VIEWS'
+                ORDER BY TABLE_NAME, ORDINAL_POSITION;";
+
+            var schemaMap = new StringBuilder();
+            schemaMap.AppendLine("### QA_EDW.VIEWS DATABASE SCHEMA ###");
+            schemaMap.AppendLine($"Generated on: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+            schemaMap.AppendLine("---------------------------------------");
+
+            using var reader = cmd.ExecuteReader();
+            string currentTable = "";
+            
+            while (reader.Read())
+            {
+                string tableName = reader.GetString(0);
+                string colName = reader.GetString(1);
+                string dataType = reader.GetString(2);
+
+                if (currentTable != tableName)
+                {
+                    schemaMap.AppendLine();
+                    schemaMap.AppendLine($"TABLE: {tableName}");
+                    currentTable = tableName;
+                }
+                schemaMap.AppendLine($"  - {colName} ({dataType})");
+            }
+
+            // Save the schema text file into the new SchemaMaps folder inside wwwroot
+            string schemaDir = Path.Combine(Env.WebRootPath, "SchemaMaps");
+            if (!Directory.Exists(schemaDir))
+            {
+                Directory.CreateDirectory(schemaDir);
+            }
+            
+            string outFilePath = Path.Combine(schemaDir, "QA_EDW_VIEWS_Schema.txt");
+            File.WriteAllText(outFilePath, schemaMap.ToString());
+        }
+        catch (Exception ex)
+        {
+            ShowMessage($"❌ Snowflake Schema Sync Error: {ex.Message}", true);
         }
     }
     
@@ -188,31 +265,22 @@
         StateHasChanged();
     }
     
-    // Recursively delete a directory and ensure read-only attributes don't block deletion
     private void DeleteDirectory(string path)
     {
         if (string.IsNullOrEmpty(path) || !Directory.Exists(path)) return;
-
         try
         {
-            // Remove read-only attribute from all files and directories
             foreach (var dir in Directory.GetDirectories(path, "*", SearchOption.AllDirectories))
-            {
                 try { File.SetAttributes(dir, FileAttributes.Normal); } catch { }
-            }
 
             foreach (var file in Directory.GetFiles(path, "*", SearchOption.AllDirectories))
-            {
                 try { File.SetAttributes(file, FileAttributes.Normal); } catch { }
-            }
-            
-            // Finally delete recursively
+
             Directory.Delete(path, recursive: true);
         }
         catch (Exception ex)
         {
-            // Rethrow as IOException with context so callers can log / display useful info
-            throw new IOException($"Failed to delete directory '{path}': {ex.Message}", ex);
+            throw new IOException($"Failed to delete directory: {ex.Message}", ex);
         }
     }
 }

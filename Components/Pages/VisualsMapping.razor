@@ -1,0 +1,155 @@
+@page "/visuals-mapping"
+@page "/snowflake-lab"
+@using System.Net.Http
+@using System.Net.Http.Headers
+@using System.Text.Json
+@inject IConfiguration Config
+
+<PageTitle>AI Diagnostics Lab</PageTitle>
+
+<div class="container-fluid mt-4">
+    <div class="card shadow-sm border-0" style="border-top: 4px solid #89bf04 !important;">
+        <div class="card-body p-4">
+            <div class="d-flex justify-content-between align-items-center mb-3">
+                <div>
+                    <h1 class="h3 mb-1">🧪 AI Connection Lab</h1>
+                    <p class="text-muted mb-0">Verify your GitHub PAT and check available AI inference models.</p>
+                </div>
+                
+                <button class="btn btn-primary fw-bold" @onclick="CheckModelsAccess" disabled="@isChecking">
+                    @if (isChecking)
+                    {
+                        <span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>
+                        <span>Querying GitHub API...</span>
+                    }
+                    else
+                    {
+                        <span>🔌 Test AI Connection</span>
+                    }
+                </button>
+            </div>
+
+            @if (!string.IsNullOrEmpty(statusMessage))
+            {
+                <div class="alert @(isError ? "alert-danger" : "alert-success") fw-bold py-2 mt-3">
+                    @statusMessage
+                </div>
+            }
+
+            @if (availableModels.Any())
+            {
+                <div class="mt-4">
+                    <h5 class="fw-bold border-bottom pb-2">Available Models for your Token:</h5>
+                    <div class="row mt-3">
+                        @foreach (var model in availableModels)
+                        {
+                            <div class="col-md-3 mb-2">
+                                <div class="p-2 border rounded shadow-sm" style="background-color: #f8f9fa; font-family: monospace; font-size: 0.9rem;">
+                                    🤖 @model
+                                </div>
+                            </div>
+                        }
+                    </div>
+                </div>
+            }
+        </div>
+    </div>
+</div>
+
+@code {
+    private bool isChecking = false;
+    private string statusMessage = "";
+    private bool isError = false;
+    private List<string> availableModels = new();
+
+    private async Task CheckModelsAccess()
+    {
+        isChecking = true;
+        statusMessage = "";
+        availableModels.Clear();
+        StateHasChanged();
+
+        try
+        {
+            // IMPORTANT: Using the new GitHub Models Token, NOT the Azure DevOps Git PAT!
+            string pat = Config["OpenAiSettings:GitHubModelsToken"];
+            string baseUrl = Config["OpenAiSettings:Endpoint"] ?? "https://models.inference.ai.azure.com";
+            
+            if (string.IsNullOrEmpty(pat))
+            {
+                ShowMessage("❌ GitHub Models Token is missing from appsettings.json under OpenAiSettings.", true);
+                return;
+            }
+
+            // Ensure base URL doesn't have /chat/completions attached so we can hit /models
+            if (baseUrl.EndsWith("/chat/completions"))
+            {
+                baseUrl = baseUrl.Replace("/chat/completions", "");
+            }
+
+            using var client = new HttpClient();
+            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", pat);
+            client.DefaultRequestHeaders.Add("User-Agent", "ReportsAutomationApp");
+
+            var response = await client.GetAsync($"{baseUrl.TrimEnd('/')}/models");
+
+            if (response.IsSuccessStatusCode)
+            {
+                var json = await response.Content.ReadAsStringAsync();
+                using var doc = JsonDocument.Parse(json);
+                
+                // Scenario 1: The API returns a raw Array directly [ {...}, {...} ]
+                if (doc.RootElement.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var model in doc.RootElement.EnumerateArray())
+                    {
+                        if (model.TryGetProperty("id", out var idProp))
+                            availableModels.Add(idProp.GetString()!);
+                        else if (model.TryGetProperty("name", out var nameProp))
+                            availableModels.Add(nameProp.GetString()!);
+                    }
+                }
+                // Scenario 2: The API returns an Object containing a "data" array { "data": [...] }
+                else if (doc.RootElement.ValueKind == JsonValueKind.Object)
+                {
+                    if (doc.RootElement.TryGetProperty("data", out var dataArray) && dataArray.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (var model in dataArray.EnumerateArray())
+                        {
+                            if (model.TryGetProperty("id", out var idProp))
+                                availableModels.Add(idProp.GetString()!);
+                            else if (model.TryGetProperty("name", out var nameProp))
+                                availableModels.Add(nameProp.GetString()!);
+                        }
+                    }
+                }
+                
+                // Clean up the list to ensure no blanks and sort it
+                availableModels = availableModels.Where(m => !string.IsNullOrEmpty(m)).Distinct().ToList();
+                availableModels.Sort();
+                
+                ShowMessage($"✅ Connection Successful! Found {availableModels.Count} models available to your PAT.", false);
+            }
+            else
+            {
+                string err = await response.Content.ReadAsStringAsync();
+                ShowMessage($"❌ GitHub API Rejected Token ({response.StatusCode}): {err}", true);
+            }
+        }
+        catch (Exception ex)
+        {
+            ShowMessage($"❌ Network/Connection Error: {ex.Message}", true);
+        }
+        finally
+        {
+            isChecking = false;
+            StateHasChanged();
+        }
+    }
+
+    private void ShowMessage(string msg, bool error)
+    {
+        statusMessage = msg;
+        isError = error;
+    }
+}

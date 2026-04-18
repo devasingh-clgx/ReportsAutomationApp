@@ -35,11 +35,12 @@ namespace ReportsAutomationApp.Services
                 string reportName = new DirectoryInfo(reportPath).Name;
                 string modelName = new DirectoryInfo(semanticModelPath).Name;
                 string exportsFolder = Path.Combine(_env.WebRootPath, "Exports");
+                string schemaFolder = Path.Combine(_env.WebRootPath, "SchemaMaps");
+                string configFolder = Path.Combine(_env.WebRootPath, "FabricRepo", "data", "SF-Source-Config");
 
                 if (!Directory.Exists(exportsFolder))
                     return new StepResult { IsSuccess = false, Message = "Exports folder not found. Please run Step 1 and 2 first." };
 
-                // 1. Find the latest Step 1 (DAX) and Step 2 (Semantic Map) files
                 var daxFile = new DirectoryInfo(exportsFolder)
                     .GetFiles($"DAX_{reportName}_*.csv")
                     .OrderByDescending(f => f.CreationTime)
@@ -50,16 +51,28 @@ namespace ReportsAutomationApp.Services
                     .OrderByDescending(f => f.CreationTime)
                     .FirstOrDefault();
 
+                string schemaPath = Path.Combine(schemaFolder, "QA_EDW_VIEWS_Schema.txt");
+                string jsonConfigPath = Path.Combine(configFolder, "EstimateLineItemConfig.json");
+
                 if (daxFile == null || mapFile == null)
                     return new StepResult { IsSuccess = false, Message = "Missing DAX CSV or Semantic Map TXT. Ensure Steps 1 & 2 are completed." };
 
+                if (!File.Exists(schemaPath))
+                    return new StepResult { IsSuccess = false, Message = "Missing Snowflake Schema. Please click 'Sync Git & Schema' on the layout page." };
+
+                if (!File.Exists(jsonConfigPath))
+                    return new StepResult { IsSuccess = false, Message = $"Missing JSON Mapping file at {jsonConfigPath}." };
+
+                // Read all three layers of context
                 string semanticContext = await File.ReadAllTextAsync(mapFile.FullName);
+                string snowflakeSchemaContext = await File.ReadAllTextAsync(schemaPath);
+                string lakehouseToSnowflakeMapping = await BuildMappingContextFromJsonAsync(jsonConfigPath);
+
                 var daxRows = ParseCsv(daxFile.FullName);
 
                 if (daxRows.Count <= 1)
                     return new StepResult { IsSuccess = false, Message = "DAX CSV is empty or only contains headers." };
 
-                // 2. Setup Azure OpenAI Client
                 string endpoint = _config["AzureOpenAI:Endpoint"]?.TrimEnd('/');
                 string deployment = _config["AzureOpenAI:DeploymentName"];
                 string apiVersion = _config["AzureOpenAI:ApiVersion"];
@@ -74,18 +87,15 @@ namespace ReportsAutomationApp.Services
                 httpClient.DefaultRequestHeaders.Clear();
                 httpClient.DefaultRequestHeaders.Add("api-key", apiKey);
 
-                // 3. Prepare the Output CSV
                 StringBuilder outputCsv = new StringBuilder();
-                // Extract headers from the first row and append our new SQL column
-                outputCsv.AppendLine(string.Join(",", daxRows[0].Select(h => $"\"{h.Replace("\"", "\"\"")}\"")) + ",\"Lakehouse_SQL\"");
+                outputCsv.AppendLine(string.Join(",", daxRows[0].Select(h => $"\"{h.Replace("\"", "\"\"")}\"")) + ",\"Final_Snowflake_SQL\"");
 
                 int processedCount = 0;
 
-                // 4. Iterate through each visual and call the LLM
                 for (int i = 1; i < daxRows.Count; i++)
                 {
                     var row = daxRows[i];
-                    if (row.Count < 10) continue; // Skip malformed rows
+                    if (row.Count < 10) continue;
 
                     string visualName = row[3];
                     string visualType = row[4];
@@ -95,50 +105,82 @@ namespace ReportsAutomationApp.Services
                     string measuresUsed = row[8];
                     string daxFormulas = row[9];
 
-                    // Construct the LLM Prompts
                     string systemPrompt = GetMasterSystemPrompt();
+
+                    // The Full Context is Back!
                     string userPrompt = $@"
-                                        ### SEMANTIC MAPPING CONTEXT:
-                                        {semanticContext}
+                        ### 1. SEMANTIC MAPPING CONTEXT (DAX Name -> Logical Lakehouse Name):
+                        {semanticContext}
 
-                                        ### VISUAL METADATA:
-                                        - Visual Name: {visualName}
-                                        - Visual Type: {visualType}
-                                        - Grouping Columns (Dimensions): {columnsUsed}
-                                        - Applied Filters (Visual Level): {visualFilters}
-                                        - Applied Filters (Page Level): {pageFilters}
+                        ### 2. LAKEHOUSE TO SNOWFLAKE TABLE MAPPING (Lakehouse Name -> Physical Snowflake View):
+                        {lakehouseToSnowflakeMapping}
 
-                                        ### DAX MEASURES TO TRANSLATE:
-                                        {daxFormulas}
+                        ### 3. SNOWFLAKE COLUMN SCHEMA (To verify existence):
+                        {snowflakeSchemaContext}
 
-                                        Write the Snowflake Lakehouse SQL query for this visual.";
+                        ### 4. VISUAL METADATA:
+                        - Visual Name: {visualName}
+                        - Visual Type: {visualType}
+                        - Grouping Columns: {columnsUsed}
+                        - Visual Filters: {visualFilters}
+                        - Page Filters: {pageFilters}
 
-                    // Call Azure OpenAI using the created HttpClient
+                        ### 5. DAX MEASURES TO TRANSLATE:
+                        {daxFormulas}
+
+                        Write the final, highly optimized Snowflake SQL query for this visual.";
+
                     string generatedSql = await CallAzureOpenAiAsync(httpClient, requestUrl, systemPrompt, userPrompt);
 
-                    // Append the original row + the new SQL to the output CSV
                     var newRow = new List<string>(row) { generatedSql };
                     outputCsv.AppendLine(string.Join(",", newRow.Select(c => $"\"{c?.Replace("\"", "\"\"") ?? ""}\"")));
                     processedCount++;
                 }
 
-                // 5. Save the generated SQL file
-                string outFileName = $"GeneratedSQL_{reportName}_{DateTime.Now:yyyyMMdd_HHmmss}.csv";
+                string outFileName = $"Final_SnowflakeSQL_{reportName}_{DateTime.Now:yyyyMMdd_HHmmss}.csv";
                 string outFilePath = Path.Combine(exportsFolder, outFileName);
                 await File.WriteAllTextAsync(outFilePath, outputCsv.ToString());
 
                 return new StepResult
                 {
                     IsSuccess = true,
-                    Message = $"Successfully generated SQL for {processedCount} visuals.",
+                    Message = $"Successfully generated direct Snowflake SQL for {processedCount} visuals.",
                     DownloadFilePath = $"/Exports/{outFileName}",
                     ExtractedDataPreview = outputCsv.ToString().Substring(0, Math.Min(outputCsv.Length, 1000)) + "...\n[Data Truncated]"
                 };
             }
             catch (Exception ex)
             {
-                return new StepResult { IsSuccess = false, Message = $"Error in SQL Generation (Step 3): {ex.Message}" };
+                return new StepResult { IsSuccess = false, Message = $"Error in SQL Generation: {ex.Message}" };
             }
+        }
+
+        private async Task<string> BuildMappingContextFromJsonAsync(string jsonPath)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("Use this mapping to convert the Lakehouse table name into the exact physical Snowflake view name.");
+            sb.AppendLine("Format: [Lakehouse Name] -> [Snowflake Target Schema].[Snowflake Target Table]");
+
+            try
+            {
+                string jsonString = await File.ReadAllTextAsync(jsonPath);
+                using (JsonDocument doc = JsonDocument.Parse(jsonString))
+                {
+                    if (doc.RootElement.TryGetProperty("Tables", out JsonElement tablesArray))
+                    {
+                        foreach (var table in tablesArray.EnumerateArray())
+                        {
+                            string lakehouseName = table.GetProperty("DName").GetString() ?? "";
+                            string snowflakeName = table.GetProperty("Name").GetString() ?? "";
+                            string schema = table.GetProperty("Schema").GetString() ?? "VIEWS";
+                            sb.AppendLine($"- {lakehouseName} -> QA_EDW.{schema}.{snowflakeName}");
+                        }
+                    }
+                }
+            }
+            catch (Exception) { }
+
+            return sb.ToString();
         }
 
         private async Task<string> CallAzureOpenAiAsync(HttpClient httpClient, string url, string systemPrompt, string userPrompt)
@@ -150,87 +192,112 @@ namespace ReportsAutomationApp.Services
                     new { role = "system", content = systemPrompt },
                     new { role = "user", content = userPrompt }
                 },
-                temperature = 0.0, // Strictly logic, zero creativity
+                temperature = 0.0,
                 max_tokens = 3000
             };
 
-            var content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
-            var response = await httpClient.PostAsync(url, content);
+            int maxRetries = 5;
+            int baseDelayMs = 5000;
 
-            if (!response.IsSuccessStatusCode)
+            for (int attempt = 1; attempt <= maxRetries; attempt++)
             {
-                string error = await response.Content.ReadAsStringAsync();
-                return $"-- ERROR: API Call Failed. {response.StatusCode}\n-- {error}";
-            }
+                var content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+                var response = await httpClient.PostAsync(url, content);
 
-            var responseJson = await response.Content.ReadAsStringAsync();
-            using (JsonDocument doc = JsonDocument.Parse(responseJson))
-            {
-                var root = doc.RootElement;
-                if (root.TryGetProperty("choices", out JsonElement choices) && choices.GetArrayLength() > 0)
+                if (response.IsSuccessStatusCode)
                 {
-                    var firstChoice = choices[0];
-                    if (firstChoice.TryGetProperty("message", out JsonElement message) && message.TryGetProperty("content", out JsonElement textContent))
+                    var responseJson = await response.Content.ReadAsStringAsync();
+                    using (JsonDocument doc = JsonDocument.Parse(responseJson))
                     {
-                        string sql = textContent.GetString();
-                        // Clean up markdown block if the model ignores the "no markdown" rule
-                        sql = sql.Replace("```sql", "").Replace("```", "").Trim();
-                        return sql;
+                        if (doc.RootElement.TryGetProperty("choices", out JsonElement choices) && choices.GetArrayLength() > 0)
+                        {
+                            var firstChoice = choices[0];
+                            if (firstChoice.TryGetProperty("message", out JsonElement message) && message.TryGetProperty("content", out JsonElement textContent))
+                            {
+                                return textContent.GetString().Replace("```sql", "").Replace("```", "").Trim();
+                            }
+                        }
                     }
+                    return "-- ERROR: Failed to parse LLM response.";
+                }
+                else if ((int)response.StatusCode == 429)
+                {
+                    if (attempt == maxRetries) return "-- ERROR: Azure OpenAI Rate Limit Exceeded after max retries.";
+
+                    int waitTime = baseDelayMs * attempt;
+                    if (response.Headers.TryGetValues("Retry-After", out var retryHeaders) && int.TryParse(retryHeaders.FirstOrDefault(), out int retrySeconds))
+                    {
+                        waitTime = retrySeconds * 1000;
+                    }
+
+                    await Task.Delay(waitTime);
+                    continue;
+                }
+                else
+                {
+                    string error = await response.Content.ReadAsStringAsync();
+                    return $"-- ERROR: API Call Failed. {response.StatusCode}\n-- {error}";
                 }
             }
 
-            return "-- ERROR: Failed to parse LLM response.";
+            return "-- ERROR: Unknown API failure.";
         }
 
         private string GetMasterSystemPrompt()
         {
             return @"You are an elite DAX-to-Snowflake-SQL compiler.
-Your job is to translate Power BI visual logic into clean, readable, and highly optimized Snowflake Lakehouse SQL.
-Output ONLY raw T-SQL/Snowflake SQL code. No talk, no notes, no markdown formatting.
+Your job is to translate Power BI visual logic into highly optimized, readable Snowflake SQL.
+Output ONLY raw Snowflake SQL code. No talk, no notes, no markdown formatting.
 
-### STRICT SCHEMA RULES (FATAL ERRORS IF IGNORED):
-1. NEVER use the DAX Table Name in your SQL query. DAX table names often contain spaces (e.g., 'MERGED ESTIMATE ITEM') and are NOT the real database tables.
-2. You MUST lookup the exact physical SQL Table Name from the provided Semantic Mapping context. 
-   - Example Context: ""- DAX Table 'MERGED ESTIMATE ITEM' -> SQL Table: [CWS].[MERGED_ESTIMATE_ITEM_DIMFACT]""
-   - Correct SQL: [CWS].[MERGED_ESTIMATE_ITEM_DIMFACT].[COLUMN_NAME]
-   - Fatal Error SQL: [CWS].[MERGED ESTIMATE ITEM].[COLUMN_NAME]
-3. NEVER default to 'dbo' if the mapping provided specifies 'CWS' or any other schema.
+### THE 3-STEP MAPPING PROCESS (CRITICAL):
+You MUST follow this mapping chain. Do not skip to Lakehouse mapping!
+1. Read the DAX Table name (e.g., 'Merged Estimate Item').
+2. Look at the SEMANTIC MAPPING CONTEXT to find the Lakehouse name (e.g., 'merged_estimate_item').
+3. Look at the LAKEHOUSE TO SNOWFLAKE TABLE MAPPING to find the physical table (e.g., 'merged_estimate_item' -> QA_EDW.VIEWS.VW_MERGED_ESTIMATE_ITEM_DIMFACT).
+4. Verify the columns against the SNOWFLAKE COLUMN SCHEMA.
+FATAL ERROR: Returning `CWS.MERGED_ESTIMATE_ITEM` in the FROM clause. You MUST use the Snowflake physical name!
+
+### STRICT SNOWFLAKE SYNTAX RULES (FATAL ERRORS IF IGNORED):
+1. NO SQL SERVER BRACKETS: NEVER use [ ]. 
+2. NO QUOTES ON IDENTIFIERS: DO NOT use double quotes around table or column names. Write the raw, uppercase identifiers (e.g., QA_EDW.VIEWS.VW_DIM_ITEM_CATEGORY).
+3. READABLE ALIASES: You MUST use short, readable table aliases when joining or selecting (e.g., FROM QA_EDW.VIEWS.VW_MERGED_ESTIMATE_ITEM_DIMFACT AS mei). Do not repeat the full table name in the SELECT or WHERE clauses.
+4. SCHEMA ENFORCEMENT: Ensure the schema from the mapping (e.g., QA_EDW.VIEWS) is used in the FROM clause.
 
 ### VISUAL AWARENESS & GROUPING RULES:
-1. If Visual Type is 'KPI', 'Card', 'Shape', or 'Textbox': Output a query that returns exactly ONE row and ONE scalar value. Do NOT use a global GROUP BY unless using a subquery.
-2. If Visual Type is 'Chart', 'Table', or 'Matrix': Include the provided ""Grouping Columns"" in both the SELECT and GROUP BY clauses.
-3. EXCEPTION TO GROUP BY: If the ""Grouping Columns"" list contains an implicit aggregation (e.g., `CountNonNull(...)` or `Sum(...)`), put the aggregation in the SELECT clause, but DO NOT put the underlying column in the GROUP BY clause.
+1. Visual Type 'KPI', 'Card', 'Shape', 'Textbox': Output a query that returns exactly ONE row and ONE scalar value. Do NOT use a global GROUP BY.
+2. Visual Type 'Chart', 'Table', 'Matrix': Include the ""Grouping Columns"" in both the SELECT and GROUP BY clauses. Apply Visual/Page filters in the global WHERE clause.
 
-### DAX-TO-SQL TRANSLATION & OPTIMIZATION RULES:
-You must translate DAX logic into clean, performant SQL. Avoid bloated, repetitive queries.
+### DAX-TO-SNOWFLAKE TRANSLATION RULES:
+Rule 1: Handling Nulls
+- Whenever performing arithmetic on columns that might contain nulls, wrap them in COALESCE(X, 0).
 
-Rule 1: Clean Global Filtering (Avoid CASE WHEN Explosions)
-- If a DAX measure uses `CALCULATE(..., Table[Column] = 'Value')` and this filter applies to the entire complex math block, DO NOT repeat `CASE WHEN Table[Column] = 'Value'` 50 times inside the SELECT.
-- Instead, apply that filter to a global `WHERE` clause, OR create a clean base CTE (e.g., `WITH FilteredBase AS (SELECT * FROM Table WHERE Column = 'Value')`) and perform the math on the CTE.
+Rule 2: Safe Division
+- MUST use NULLIF. Example: SUM(mei.SALES) / NULLIF(SUM(mei.COSTS), 0)
 
-Rule 2: Handling Blanks, Nulls, and Zeroes safely but cleanly
-- DAX ignores nulls in addition. SQL does not (`NULL + 5 = NULL`).
-- When adding columns, use COALESCE cleanly: `SUM(COALESCE(Col1, 0) + COALESCE(Col2, 0))`. Do NOT over-nest COALESCE functions unneccessarily.
+Rule 3: Translating CALCULATE
+- CALCULATE almost always translates to conditional aggregation using CASE WHEN inside an aggregate function. Example: SUM(CASE WHEN Region = 'North' THEN Sales ELSE 0 END).
 
-Rule 3: Safe Division (Divide by Zero)
-- Division (/) throws a fatal error if denominator is 0. 
-- MUST use NULLIF: `SUM(Sales) / NULLIF(SUM(Costs), 0)`
+Rule 4: COUNT and DISTINCT
+- Treat DAX COUNT() identically to DISTINCTCOUNT(). Both should be translated to COUNT(DISTINCT alias.column) in Snowflake.
 
-Rule 4: Time Intelligence
-- TOTALYTD translates to: `SUM(Sales) OVER (PARTITION BY YEAR(Date) ORDER BY Date)`
-- SAMEPERIODLASTYEAR translates to: `DATEADD(year, -1, Date)`
+Rule 5: Case-Insensitive ORDER BY (CRITICAL FOR CHARTS/TABLES)
+- DAX sorting is case-insensitive. Snowflake is case-sensitive.
+- If the visual has grouping columns, you MUST add an ORDER BY clause. 
+- When applying an ORDER BY on a string column to mimic DAX, wrap the column in UPPER(). 
+- Example: ORDER BY UPPER(mei.CATEGORY_NAME)
 
-Rule 5: VARIABLES (VAR)
-- If a DAX `VAR` is a scalar mathematical result, calculate it inline. 
-- If a DAX `VAR` generates a filtered sub-table that is heavily reused, turn it into a CTE.";
+Rule 6: Time Intelligence
+- TOTALYTD translates to: SUM(Sales) OVER (PARTITION BY YEAR(Date) ORDER BY Date)
+- SAMEPERIODLASTYEAR translates to: DATEADD(year, -1, Date)
+
+Rule 7: VARIABLES (VAR)
+- If a VAR is a scalar number, calculate it inline. Only use CTEs (WITH clause) for modular, heavily reused table subqueries.";
         }
-        // --- Robust Custom CSV Parser to handle newlines inside DAX strings ---
+
         private List<List<string>> ParseCsv(string filePath)
         {
             var parsedData = new List<List<string>>();
             string fileContent = File.ReadAllText(filePath);
-
             var currentRow = new List<string>();
             StringBuilder currentCell = new StringBuilder();
             bool inQuotes = false;
@@ -238,49 +305,28 @@ Rule 5: VARIABLES (VAR)
             for (int i = 0; i < fileContent.Length; i++)
             {
                 char c = fileContent[i];
-
                 if (c == '\"')
                 {
-                    // Handle escaped quotes ("")
-                    if (inQuotes && i + 1 < fileContent.Length && fileContent[i + 1] == '\"')
-                    {
-                        currentCell.Append('\"');
-                        i++; // Skip the second quote
-                    }
-                    else
-                    {
-                        inQuotes = !inQuotes;
-                    }
+                    if (inQuotes && i + 1 < fileContent.Length && fileContent[i + 1] == '\"') { currentCell.Append('\"'); i++; }
+                    else { inQuotes = !inQuotes; }
                 }
                 else if (c == ',' && !inQuotes)
                 {
-                    currentRow.Add(currentCell.ToString());
-                    currentCell.Clear();
+                    currentRow.Add(currentCell.ToString()); currentCell.Clear();
                 }
                 else if ((c == '\r' || c == '\n') && !inQuotes)
                 {
-                    if (c == '\r' && i + 1 < fileContent.Length && fileContent[i + 1] == '\n') i++; // Handle \r\n
-
-                    currentRow.Add(currentCell.ToString());
-                    currentCell.Clear();
-
-                    if (currentRow.Any(cell => !string.IsNullOrWhiteSpace(cell)))
-                    {
-                        parsedData.Add(new List<string>(currentRow));
-                    }
+                    if (c == '\r' && i + 1 < fileContent.Length && fileContent[i + 1] == '\n') i++;
+                    currentRow.Add(currentCell.ToString()); currentCell.Clear();
+                    if (currentRow.Any(cell => !string.IsNullOrWhiteSpace(cell))) parsedData.Add(new List<string>(currentRow));
                     currentRow.Clear();
                 }
-                else
-                {
-                    currentCell.Append(c);
-                }
+                else { currentCell.Append(c); }
             }
 
-            // Add the final row if file doesn't end with newline
             if (currentCell.Length > 0 || currentRow.Count > 0)
             {
-                currentRow.Add(currentCell.ToString());
-                parsedData.Add(currentRow);
+                currentRow.Add(currentCell.ToString()); parsedData.Add(currentRow);
             }
 
             return parsedData;

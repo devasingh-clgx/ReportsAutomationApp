@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -27,6 +28,9 @@ namespace ReportsAutomationApp.Services
             {
                 string tablesFolderPath = Path.Combine(semanticModelPath, "definition", "tables");
                 string pagesPath = Path.Combine(reportPath, "definition", "pages");
+                string bookmarksPath = Path.Combine(reportPath, "definition", "bookmarks");
+                string reportExtensionsPath = Path.Combine(reportPath, "definition", "reportExtensions.json");
+
                 string reportName = new DirectoryInfo(reportPath).Name;
                 string modelName = new DirectoryInfo(semanticModelPath).Name;
 
@@ -38,21 +42,29 @@ namespace ReportsAutomationApp.Services
 
                 var daxDictionary = ExtractAllDax(tablesFolderPath);
 
+                var reportLevelDax = ExtractReportExtensionsDax(reportExtensionsPath);
+                foreach (var kvp in reportLevelDax)
+                {
+                    daxDictionary[kvp.Key] = kvp.Value;
+                }
+
+                // Safely extract bookmarks, page assignments, and their specific Date Filters!
+                var allBookmarks = ExtractAllBookmarks(bookmarksPath);
+
                 StringBuilder csvContent = new StringBuilder();
-                // UPDATE 1: Split ItemsUsed into ColumnsUsed and MeasuresUsed
-                csvContent.AppendLine("ScenarioId,ModelName,PageName,VisualName,VisualType,VisualFilters,PageFilters,ColumnsUsed,MeasuresUsed,Dax");
+
+                // Reverted to your required columns! No extra scenario columns.
+                csvContent.AppendLine("ScenarioId,ModelName,PageName,VisualId,VisualName,VisualType,VisualFilters,PageFilters,ColumnsUsed,MeasuresUsed,Dax");
 
                 int visualsProcessed = 0;
                 int scenarioIdCounter = 1;
 
                 foreach (var pageFolder in Directory.GetDirectories(pagesPath))
                 {
-                    // ... (keep the pageName and pageJson parsing exactly the same) ...
-
-                    // (Assuming you kept the page logic here...)
-                    string pageName = new DirectoryInfo(pageFolder).Name;
+                    string pageId = new DirectoryInfo(pageFolder).Name;
+                    string pageName = pageId;
                     string pageJsonPath = Path.Combine(pageFolder, "page.json");
-                    string pageFiltersFormatted = "None";
+                    string basePageFiltersFormatted = "None";
 
                     if (File.Exists(pageJsonPath))
                     {
@@ -66,11 +78,14 @@ namespace ReportsAutomationApp.Services
 
                                 List<string> pageFilters = new List<string>();
                                 FindFilters(pageDoc.RootElement, pageFilters);
-                                if (pageFilters.Count > 0) pageFiltersFormatted = string.Join(" | ", pageFilters);
+                                if (pageFilters.Count > 0) basePageFiltersFormatted = string.Join(" | ", pageFilters);
                             }
                         }
                         catch { }
                     }
+
+                    // Find bookmarks specifically for this page
+                    var pageBookmarks = allBookmarks.Where(b => b.PageId == pageId).ToList();
 
                     string visualsPath = Path.Combine(pageFolder, "visuals");
                     if (!Directory.Exists(visualsPath)) continue;
@@ -86,14 +101,14 @@ namespace ReportsAutomationApp.Services
                             using (JsonDocument doc = JsonDocument.Parse(jsonContent))
                             {
                                 string visualCategory = ExtractVisualCategory(doc);
-                                string visualName = ExtractVisualTitle(doc, visualId, visualCategory);
+                                string baseVisualName = ExtractVisualTitle(doc, visualId, visualCategory);
 
                                 List<string> visualFilters = new List<string>();
                                 FindFilters(doc.RootElement, visualFilters);
                                 string visualFiltersFormatted = visualFilters.Count > 0 ? string.Join(" | ", visualFilters) : "None";
 
                                 List<string> rawQueryRefs = new List<string>();
-                                FindQueryRefs(doc.RootElement, rawQueryRefs);
+                                FindQueryRefs(doc.RootElement, rawQueryRefs); // Safe extraction (keeps Tooltips)
 
                                 if (rawQueryRefs.Count > 0)
                                 {
@@ -101,11 +116,9 @@ namespace ReportsAutomationApp.Services
                                     List<string> measuresUsed = new List<string>();
                                     StringBuilder combinedDax = new StringBuilder();
 
-                                    // NEW: Setup the recursive tracker queues
                                     HashSet<string> resolvedMeasures = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                                     Queue<string> measureQueue = new Queue<string>();
 
-                                    // 1. Initial pass from visual elements
                                     foreach (var qRef in rawQueryRefs)
                                     {
                                         string cleanName = qRef;
@@ -123,34 +136,29 @@ namespace ReportsAutomationApp.Services
                                         }
                                         else
                                         {
-                                            // If it's not a DAX measure, it must be a physical column!
                                             if (!columnsUsed.Contains(qRef)) columnsUsed.Add(qRef);
                                         }
                                     }
 
-                                    // 2. GAP 1 FIX: Recursive DAX Lineage Tracer!
                                     while (measureQueue.Count > 0)
                                     {
                                         string currentMeasure = measureQueue.Dequeue();
                                         string currentDax = daxDictionary[currentMeasure];
 
-                                        // Append the current measure to our final output
                                         combinedDax.AppendLine($"--- {currentMeasure} ---");
                                         combinedDax.AppendLine(currentDax);
                                         combinedDax.AppendLine();
 
-                                        // Scan the DAX math for nested references like: [Estimate Item Key Count]
                                         var matches = Regex.Matches(currentDax, @"\[([^\]]+)\]");
                                         foreach (Match match in matches)
                                         {
                                             string nestedItem = match.Groups[1].Value.Trim();
 
-                                            // If this nested item is a known measure we haven't processed yet...
                                             if (daxDictionary.ContainsKey(nestedItem) && !resolvedMeasures.Contains(nestedItem))
                                             {
                                                 resolvedMeasures.Add(nestedItem);
                                                 measureQueue.Enqueue(nestedItem);
-                                                measuresUsed.Add(nestedItem); // Add to the CSV column list so the LLM knows it's there
+                                                measuresUsed.Add(nestedItem);
                                             }
                                         }
                                     }
@@ -159,24 +167,60 @@ namespace ReportsAutomationApp.Services
                                     string measuresStr = measuresUsed.Count > 0 ? string.Join("\n", measuresUsed) : "None";
                                     string finalDax = combinedDax.ToString().Trim();
 
-                                    if (string.IsNullOrEmpty(finalDax))
-                                        finalDax = "No DAX Formulas";
+                                    if (string.IsNullOrEmpty(finalDax)) finalDax = "No DAX Formulas";
 
+                                    // --- 1. ALWAYS Output the Default "Base" Scenario First ---
                                     csvContent.AppendLine(FormatCsvRow(
                                         scenarioIdCounter.ToString(),
                                         modelName,
                                         pageName,
-                                        visualName,
+                                        visualId,
+                                        baseVisualName,
                                         visualCategory,
                                         visualFiltersFormatted,
-                                        pageFiltersFormatted,
+                                        basePageFiltersFormatted,
                                         columnsStr,
                                         measuresStr,
                                         finalDax
                                     ));
-
-                                    visualsProcessed++;
                                     scenarioIdCounter++;
+
+                                    // --- 2. Iterate Bookmark Scenarios for this Page ---
+                                    foreach (var bm in pageBookmarks)
+                                    {
+                                        // If the bookmark explicitly hides this chart, skip generating a row for it!
+                                        if (bm.HiddenVisuals.Contains(visualId))
+                                            continue;
+
+                                        // Name the visual cleanly (e.g., "Item Category - DEP Created DT Last Yr")
+                                        string bmkVisualName = $"{baseVisualName} - {bm.Name}";
+
+                                        // Merge Date Filters into the global PageFilters string
+                                        string combinedPageFilters = basePageFiltersFormatted;
+                                        if (bm.Filters.Count > 0)
+                                        {
+                                            string extraFilters = string.Join(" | ", bm.Filters);
+                                            combinedPageFilters = (combinedPageFilters == "None" || string.IsNullOrWhiteSpace(combinedPageFilters))
+                                                ? extraFilters
+                                                : $"{combinedPageFilters} | {extraFilters}";
+                                        }
+
+                                        csvContent.AppendLine(FormatCsvRow(
+                                            scenarioIdCounter.ToString(),
+                                            modelName,
+                                            pageName,
+                                            visualId,
+                                            bmkVisualName,
+                                            visualCategory,
+                                            visualFiltersFormatted,
+                                            combinedPageFilters,
+                                            columnsStr,
+                                            measuresStr,
+                                            finalDax
+                                        ));
+                                        scenarioIdCounter++;
+                                    }
+                                    visualsProcessed++;
                                 }
                             }
                         }
@@ -194,9 +238,9 @@ namespace ReportsAutomationApp.Services
                 return new StepResult
                 {
                     IsSuccess = true,
-                    Message = $"Successfully extracted {visualsProcessed} visuals with filter data.",
+                    Message = $"Successfully extracted {visualsProcessed} visuals with all Bookmark Date scenarios.",
                     DownloadFilePath = $"/Exports/{fileName}",
-                    ExtractedDataPreview = csvContent.ToString().Substring(0, Math.Min(csvContent.Length, 500)) + "...\n[Data Truncated for Preview]"
+                    ExtractedDataPreview = csvContent.ToString().Substring(0, Math.Min(csvContent.Length, 500)) + "...\n[Data Truncated]"
                 };
             }
             catch (Exception ex)
@@ -205,8 +249,118 @@ namespace ReportsAutomationApp.Services
             }
         }
 
+
         // =========================================================
-        // POWER BI AST FILTER PARSER (The Magic Sauce)
+        // PARSERS: Report Extensions & Bookmarks
+        // =========================================================
+
+        public class BookmarkData
+        {
+            public string Name { get; set; }
+            public string PageId { get; set; }
+            public HashSet<string> HiddenVisuals { get; set; } = new HashSet<string>();
+            public List<string> Filters { get; set; } = new List<string>();
+        }
+
+        private Dictionary<string, string> ExtractReportExtensionsDax(string jsonPath)
+        {
+            var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (!File.Exists(jsonPath)) return dict;
+
+            try
+            {
+                using var doc = JsonDocument.Parse(File.ReadAllText(jsonPath));
+                if (doc.RootElement.TryGetProperty("entities", out var entitiesArray) && entitiesArray.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var entity in entitiesArray.EnumerateArray())
+                    {
+                        if (entity.TryGetProperty("measures", out var measuresArray) && measuresArray.ValueKind == JsonValueKind.Array)
+                        {
+                            foreach (var measure in measuresArray.EnumerateArray())
+                            {
+                                if (measure.TryGetProperty("name", out var nameElement) &&
+                                    measure.TryGetProperty("expression", out var exprElement))
+                                {
+                                    dict[nameElement.GetString()] = exprElement.GetString();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+            return dict;
+        }
+
+        private List<BookmarkData> ExtractAllBookmarks(string bookmarksPath)
+        {
+            var bookmarks = new List<BookmarkData>();
+            if (!Directory.Exists(bookmarksPath)) return bookmarks;
+
+            foreach (var file in Directory.GetFiles(bookmarksPath, "*.bookmark.json"))
+            {
+                try
+                {
+                    using var doc = JsonDocument.Parse(File.ReadAllText(file));
+                    var root = doc.RootElement;
+                    var bookmark = new BookmarkData();
+
+                    if (root.TryGetProperty("displayName", out var nameElement))
+                        bookmark.Name = nameElement.GetString();
+                    else if (root.TryGetProperty("name", out var internalName))
+                        bookmark.Name = internalName.GetString();
+
+                    if (root.TryGetProperty("explorationState", out var expState))
+                    {
+                        if (expState.TryGetProperty("activeSection", out var activeSec))
+                            bookmark.PageId = activeSec.GetString();
+
+                        List<string> rawFilters = new List<string>();
+                        FindFilters(expState, rawFilters);
+                        if (rawFilters.Count > 0)
+                            bookmark.Filters = new HashSet<string>(rawFilters).ToList();
+                    }
+
+                    ExtractHiddenVisuals(root, bookmark.HiddenVisuals);
+
+                    bookmarks.Add(bookmark);
+                }
+                catch { }
+            }
+            return bookmarks;
+        }
+
+        private void ExtractHiddenVisuals(JsonElement element, HashSet<string> hiddenVisuals)
+        {
+            if (element.ValueKind == JsonValueKind.Object)
+            {
+                foreach (var prop in element.EnumerateObject())
+                {
+                    if (prop.Value.ValueKind == JsonValueKind.Object)
+                    {
+                        if (prop.Value.TryGetProperty("isHidden", out JsonElement hiddenEl) && hiddenEl.ValueKind == JsonValueKind.True)
+                            hiddenVisuals.Add(prop.Name);
+
+                        ExtractHiddenVisuals(prop.Value, hiddenVisuals);
+                    }
+                    else if (prop.Value.ValueKind == JsonValueKind.Array)
+                    {
+                        ExtractHiddenVisuals(prop.Value, hiddenVisuals);
+                    }
+                }
+            }
+            else if (element.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var item in element.EnumerateArray())
+                {
+                    ExtractHiddenVisuals(item, hiddenVisuals);
+                }
+            }
+        }
+
+
+        // =========================================================
+        // POWER BI AST FILTER PARSER 
         // =========================================================
 
         private void FindFilters(JsonElement element, List<string> filterExpressions)
@@ -215,31 +369,29 @@ namespace ReportsAutomationApp.Services
             {
                 foreach (JsonProperty prop in element.EnumerateObject())
                 {
-                    if (prop.Name == "filters" && prop.Value.ValueKind == JsonValueKind.Array)
+                    if (prop.Name == "filter" && prop.Value.ValueKind == JsonValueKind.Object)
+                    {
+                        ExtractFilterExpressions(prop.Value, filterExpressions);
+                    }
+                    else if (prop.Name == "filters" && prop.Value.ValueKind == JsonValueKind.Array)
                     {
                         foreach (JsonElement filterItem in prop.Value.EnumerateArray())
                         {
                             if (filterItem.ValueKind == JsonValueKind.Object && filterItem.TryGetProperty("filter", out JsonElement filterDef))
-                            {
                                 ExtractFilterExpressions(filterDef, filterExpressions);
-                            }
                             else
-                            {
                                 ExtractFilterExpressions(filterItem, filterExpressions);
-                            }
                         }
                     }
                     else if (prop.Value.ValueKind == JsonValueKind.String)
                     {
                         string strVal = prop.Value.GetString();
-                        if (strVal != null && strVal.Contains("\"filters\""))
+                        if (strVal != null && strVal.Contains("\"filter"))
                         {
                             try
                             {
-                                using (var innerDoc = JsonDocument.Parse(strVal))
-                                {
-                                    FindFilters(innerDoc.RootElement, filterExpressions);
-                                }
+                                using var innerDoc = JsonDocument.Parse(strVal);
+                                FindFilters(innerDoc.RootElement, filterExpressions);
                             }
                             catch { }
                         }
@@ -284,13 +436,19 @@ namespace ReportsAutomationApp.Services
             }
         }
 
-        // Translates Power BI's AST into SQL-like readable strings
         private string ParseConditionAst(JsonElement node)
         {
             if (node.ValueKind != JsonValueKind.Object) return "";
             List<string> parts = new List<string>();
 
-            if (node.TryGetProperty("Not", out JsonElement notNode))
+            if (node.TryGetProperty("Between", out JsonElement betNode))
+            {
+                string prop = GetPropertyPath(betNode);
+                string lower = GetExpressionValue(betNode.TryGetProperty("LowerBound", out var lb) ? lb : default);
+                string upper = GetExpressionValue(betNode.TryGetProperty("UpperBound", out var ub) ? ub : default);
+                return $"{prop} BETWEEN {lower} AND {upper}";
+            }
+            else if (node.TryGetProperty("Not", out JsonElement notNode))
             {
                 string inner = ParseConditionAst(notNode);
                 if (!string.IsNullOrEmpty(inner)) return $"NOT ({inner})";
@@ -337,7 +495,6 @@ namespace ReportsAutomationApp.Services
             }
             else
             {
-                // Traverse down for wrapped nodes (like 'Expression')
                 foreach (JsonProperty prop in node.EnumerateObject())
                 {
                     if (prop.Value.ValueKind == JsonValueKind.Object)
@@ -345,10 +502,55 @@ namespace ReportsAutomationApp.Services
                         string res = ParseConditionAst(prop.Value);
                         if (!string.IsNullOrEmpty(res)) parts.Add(res);
                     }
+                    // FIX: This is the missing piece! It must drill into Arrays to find the Date constraints!
+                    else if (prop.Value.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (JsonElement item in prop.Value.EnumerateArray())
+                        {
+                            if (item.ValueKind == JsonValueKind.Object)
+                            {
+                                string res = ParseConditionAst(item);
+                                if (!string.IsNullOrEmpty(res)) parts.Add(res);
+                            }
+                        }
+                    }
                 }
             }
 
             return parts.Count > 0 ? string.Join(" AND ", parts) : "";
+        }
+
+        private string GetExpressionValue(JsonElement node)
+        {
+            if (node.ValueKind != JsonValueKind.Object) return "";
+
+            if (node.TryGetProperty("Literal", out JsonElement literal))
+            {
+                return literal.TryGetProperty("Value", out JsonElement val) ? (val.GetString() ?? "null") : "null";
+            }
+            if (node.TryGetProperty("DateTime", out JsonElement dt))
+            {
+                return dt.TryGetProperty("Date", out JsonElement dVal) ? $"'{dVal.GetString()}'" : "datetime";
+            }
+            if (node.TryGetProperty("DateSpan", out JsonElement ds))
+            {
+                return ds.TryGetProperty("Expression", out JsonElement exp) ? GetExpressionValue(exp) : "";
+            }
+            if (node.TryGetProperty("DateAdd", out JsonElement da))
+            {
+                string inner = da.TryGetProperty("Expression", out JsonElement exp) ? GetExpressionValue(exp) : "";
+                int amount = da.TryGetProperty("Amount", out JsonElement amt) ? amt.GetInt32() : 0;
+                int timeUnit = da.TryGetProperty("TimeUnit", out JsonElement tu) ? tu.GetInt32() : 0;
+
+                string unitStr = timeUnit == 0 ? "Day" : (timeUnit == 1 ? "Week" : (timeUnit == 2 ? "Month" : "Year"));
+                return $"DATEADD({unitStr}, {amount}, {inner})";
+            }
+            if (node.TryGetProperty("Now", out _))
+            {
+                return "NOW()";
+            }
+
+            return GetLiteralValues(node);
         }
 
         private string GetPropertyPath(JsonElement node)
@@ -374,7 +576,6 @@ namespace ReportsAutomationApp.Services
                     string propName = valNode.GetString();
                     string tableName = "";
 
-                    // Attempt to extract the Table Name (Entity) from the AST
                     if (node.TryGetProperty("Expression", out JsonElement exprNode) &&
                         exprNode.ValueKind == JsonValueKind.Object &&
                         exprNode.TryGetProperty("SourceRef", out JsonElement sourceNode) &&
@@ -431,7 +632,6 @@ namespace ReportsAutomationApp.Services
             {
                 var root = doc.RootElement;
 
-                // 1. Check NEW PBIR format: visualContainerObjects -> title (Overall Title)
                 if (root.TryGetProperty("visualContainerObjects", out JsonElement vcObj) &&
                     vcObj.TryGetProperty("title", out JsonElement titleArr) &&
                     titleArr.ValueKind == JsonValueKind.Array &&
@@ -450,7 +650,6 @@ namespace ReportsAutomationApp.Services
 
                 if (root.TryGetProperty("visual", out JsonElement visualElement))
                 {
-                    // 2. Check NEW PBIR format: visual.objects -> header (Slicer Header)
                     if (visualElement.TryGetProperty("objects", out JsonElement objectsElement) &&
                         objectsElement.TryGetProperty("header", out JsonElement headerArr) &&
                         headerArr.ValueKind == JsonValueKind.Array &&
@@ -467,7 +666,6 @@ namespace ReportsAutomationApp.Services
                         }
                     }
 
-                    // 3. Try finding the "displayName" in the query projections (Field Names)
                     if (visualElement.TryGetProperty("query", out JsonElement queryElement) &&
                         queryElement.TryGetProperty("queryState", out JsonElement queryStateElement))
                     {
@@ -489,7 +687,6 @@ namespace ReportsAutomationApp.Services
                         }
                     }
 
-                    // 4. OLD PBIX FORMAT (stringified config fallback)
                     if (visualElement.TryGetProperty("config", out JsonElement configElement))
                     {
                         string configStr = configElement.GetString();
@@ -505,11 +702,11 @@ namespace ReportsAutomationApp.Services
                     }
                 }
             }
-            catch { /* Ignore errors and just use the fallback below */ }
+            catch { }
 
-            // Fallback: If absolutely nothing exists, return VisualType + ID
             return $"{visualCategory} ({visualId.Substring(0, Math.Min(visualId.Length, 8))})";
         }
+
         private Dictionary<string, string> ExtractAllDax(string tablesFolderPath)
         {
             var daxDictionary = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -577,7 +774,6 @@ namespace ReportsAutomationApp.Services
             return "Chart";
         }
 
-
         private void FindQueryRefs(JsonElement element, List<string> foundItems)
         {
             if (element.ValueKind == JsonValueKind.Object)
@@ -589,12 +785,18 @@ namespace ReportsAutomationApp.Services
                         string daxRef = prop.Value.GetString();
                         if (!foundItems.Contains(daxRef)) foundItems.Add(daxRef);
                     }
-                    else FindQueryRefs(prop.Value, foundItems);
+                    else
+                    {
+                        FindQueryRefs(prop.Value, foundItems);
+                    }
                 }
             }
             else if (element.ValueKind == JsonValueKind.Array)
             {
-                foreach (JsonElement item in element.EnumerateArray()) FindQueryRefs(item, foundItems);
+                foreach (JsonElement item in element.EnumerateArray())
+                {
+                    FindQueryRefs(item, foundItems);
+                }
             }
         }
 
