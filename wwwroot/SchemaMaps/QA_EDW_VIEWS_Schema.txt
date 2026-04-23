@@ -1,5 +1,5 @@
 ### QA_EDW.VIEWS DATABASE SCHEMA ###
-Generated on: 2026-04-18 00:40:06
+Generated on: 2026-04-21 21:14:28
 ---------------------------------------
 
 TABLE: DIM_CLAIM_ESTIMATE_ASSIGNMENT_RLS

@@ -9,8 +9,10 @@ builder.Services.AddRazorComponents()
 builder.Services.AddHttpClient();
 builder.Services.AddScoped<IExtractionStep, DaxExtractorService>();
 builder.Services.AddScoped<IExtractionStep, SemanticMapperService>();
+//builder.Services.AddScoped<IExtractionStep, BatchSqlGeneratorService>();
 builder.Services.AddScoped<IExtractionStep, SqlGeneratorService>();
 //builder.Services.AddScoped<IExtractionStep, SnowflakeCortexService>(); 
+builder.Services.AddScoped<IExtractionStep, SqlOptimizerService>();
 builder.Services.AddScoped<ExtractionOrchestrator>();
 
 var app = builder.Build();

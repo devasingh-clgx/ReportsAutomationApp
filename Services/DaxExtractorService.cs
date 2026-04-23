@@ -32,6 +32,7 @@ namespace ReportsAutomationApp.Services
                 string reportExtensionsPath = Path.Combine(reportPath, "definition", "reportExtensions.json");
 
                 string reportName = new DirectoryInfo(reportPath).Name;
+                string safeReportName = ExportFileNameHelper.ToSafeToken(reportName);
                 string modelName = new DirectoryInfo(semanticModelPath).Name;
 
                 if (!Directory.Exists(tablesFolderPath))
@@ -51,13 +52,9 @@ namespace ReportsAutomationApp.Services
                 // Safely extract bookmarks, page assignments, and their specific Date Filters!
                 var allBookmarks = ExtractAllBookmarks(bookmarksPath);
 
-                StringBuilder csvContent = new StringBuilder();
-
-                // Reverted to your required columns! No extra scenario columns.
-                csvContent.AppendLine("ScenarioId,ModelName,PageName,VisualId,VisualName,VisualType,VisualFilters,PageFilters,ColumnsUsed,MeasuresUsed,Dax");
+                var extractedRows = new List<ExportRow>();
 
                 int visualsProcessed = 0;
-                int scenarioIdCounter = 1;
 
                 foreach (var pageFolder in Directory.GetDirectories(pagesPath))
                 {
@@ -113,11 +110,7 @@ namespace ReportsAutomationApp.Services
                                 if (rawQueryRefs.Count > 0)
                                 {
                                     List<string> columnsUsed = new List<string>();
-                                    List<string> measuresUsed = new List<string>();
-                                    StringBuilder combinedDax = new StringBuilder();
-
-                                    HashSet<string> resolvedMeasures = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                                    Queue<string> measureQueue = new Queue<string>();
+                                    var seededMeasures = new List<string>();
 
                                     foreach (var qRef in rawQueryRefs)
                                     {
@@ -127,11 +120,9 @@ namespace ReportsAutomationApp.Services
 
                                         if (daxDictionary.ContainsKey(cleanName))
                                         {
-                                            if (!resolvedMeasures.Contains(cleanName))
+                                            if (!seededMeasures.Contains(cleanName, StringComparer.OrdinalIgnoreCase))
                                             {
-                                                resolvedMeasures.Add(cleanName);
-                                                measureQueue.Enqueue(cleanName);
-                                                measuresUsed.Add(cleanName);
+                                                seededMeasures.Add(cleanName);
                                             }
                                         }
                                         else
@@ -140,85 +131,56 @@ namespace ReportsAutomationApp.Services
                                         }
                                     }
 
-                                    while (measureQueue.Count > 0)
-                                    {
-                                        string currentMeasure = measureQueue.Dequeue();
-                                        string currentDax = daxDictionary[currentMeasure];
-
-                                        combinedDax.AppendLine($"--- {currentMeasure} ---");
-                                        combinedDax.AppendLine(currentDax);
-                                        combinedDax.AppendLine();
-
-                                        var matches = Regex.Matches(currentDax, @"\[([^\]]+)\]");
-                                        foreach (Match match in matches)
-                                        {
-                                            string nestedItem = match.Groups[1].Value.Trim();
-
-                                            if (daxDictionary.ContainsKey(nestedItem) && !resolvedMeasures.Contains(nestedItem))
-                                            {
-                                                resolvedMeasures.Add(nestedItem);
-                                                measureQueue.Enqueue(nestedItem);
-                                                measuresUsed.Add(nestedItem);
-                                            }
-                                        }
-                                    }
-
                                     string columnsStr = columnsUsed.Count > 0 ? string.Join("\n", columnsUsed) : "None";
-                                    string measuresStr = measuresUsed.Count > 0 ? string.Join("\n", measuresUsed) : "None";
-                                    string finalDax = combinedDax.ToString().Trim();
 
-                                    if (string.IsNullOrEmpty(finalDax)) finalDax = "No DAX Formulas";
+                                    var exportDefinitions = BuildExportDefinitions(doc, visualCategory, baseVisualName, seededMeasures, daxDictionary);
 
-                                    // --- 1. ALWAYS Output the Default "Base" Scenario First ---
-                                    csvContent.AppendLine(FormatCsvRow(
-                                        scenarioIdCounter.ToString(),
-                                        modelName,
-                                        pageName,
-                                        visualId,
-                                        baseVisualName,
-                                        visualCategory,
-                                        visualFiltersFormatted,
-                                        basePageFiltersFormatted,
-                                        columnsStr,
-                                        measuresStr,
-                                        finalDax
-                                    ));
-                                    scenarioIdCounter++;
-
-                                    // --- 2. Iterate Bookmark Scenarios for this Page ---
-                                    foreach (var bm in pageBookmarks)
+                                    foreach (var exportDefinition in exportDefinitions)
                                     {
-                                        // If the bookmark explicitly hides this chart, skip generating a row for it!
-                                        if (bm.HiddenVisuals.Contains(visualId))
-                                            continue;
-
-                                        // Name the visual cleanly (e.g., "Item Category - DEP Created DT Last Yr")
-                                        string bmkVisualName = $"{baseVisualName} - {bm.Name}";
-
-                                        // Merge Date Filters into the global PageFilters string
-                                        string combinedPageFilters = basePageFiltersFormatted;
-                                        if (bm.Filters.Count > 0)
-                                        {
-                                            string extraFilters = string.Join(" | ", bm.Filters);
-                                            combinedPageFilters = (combinedPageFilters == "None" || string.IsNullOrWhiteSpace(combinedPageFilters))
-                                                ? extraFilters
-                                                : $"{combinedPageFilters} | {extraFilters}";
-                                        }
-
-                                        csvContent.AppendLine(FormatCsvRow(
-                                            scenarioIdCounter.ToString(),
+                                        extractedRows.Add(new ExportRow(
                                             modelName,
                                             pageName,
                                             visualId,
-                                            bmkVisualName,
+                                            exportDefinition.VisualName,
                                             visualCategory,
                                             visualFiltersFormatted,
-                                            combinedPageFilters,
+                                            basePageFiltersFormatted,
                                             columnsStr,
-                                            measuresStr,
-                                            finalDax
-                                        ));
-                                        scenarioIdCounter++;
+                                            exportDefinition.MeasuresUsed,
+                                            exportDefinition.Dax));
+
+                                        // --- 2. Iterate Bookmark Scenarios for this Page ---
+                                        foreach (var bm in pageBookmarks)
+                                        {
+                                            // If the bookmark explicitly hides this chart, skip generating a row for it!
+                                            if (bm.HiddenVisuals.Contains(visualId))
+                                                continue;
+
+                                            // Name the visual cleanly (e.g., "Item Category - DEP Created DT Last Yr")
+                                            string bmkVisualName = $"{exportDefinition.VisualName} - {bm.Name}";
+
+                                            // Merge Date Filters into the global PageFilters string
+                                            string combinedPageFilters = basePageFiltersFormatted;
+                                            if (bm.Filters.Count > 0)
+                                            {
+                                                string extraFilters = string.Join(" | ", bm.Filters);
+                                                combinedPageFilters = (combinedPageFilters == "None" || string.IsNullOrWhiteSpace(combinedPageFilters))
+                                                    ? extraFilters
+                                                    : $"{combinedPageFilters} | {extraFilters}";
+                                            }
+
+                                            extractedRows.Add(new ExportRow(
+                                                modelName,
+                                                pageName,
+                                                visualId,
+                                                bmkVisualName,
+                                                visualCategory,
+                                                visualFiltersFormatted,
+                                                combinedPageFilters,
+                                                columnsStr,
+                                                exportDefinition.MeasuresUsed,
+                                                exportDefinition.Dax));
+                                        }
                                     }
                                     visualsProcessed++;
                                 }
@@ -227,10 +189,33 @@ namespace ReportsAutomationApp.Services
                     }
                 }
 
+                var deduplicatedRows = DeduplicateRows(extractedRows);
+                int duplicatesRemoved = extractedRows.Count - deduplicatedRows.Count;
+
+                StringBuilder csvContent = new StringBuilder();
+                csvContent.AppendLine("ScenarioId,ModelName,PageName,VisualId,VisualName,VisualType,VisualFilters,PageFilters,ColumnsUsed,MeasuresUsed,Dax");
+
+                for (int i = 0; i < deduplicatedRows.Count; i++)
+                {
+                    var row = deduplicatedRows[i];
+                    csvContent.AppendLine(FormatCsvRow(
+                        (i + 1).ToString(),
+                        row.ModelName,
+                        row.PageName,
+                        row.VisualId,
+                        row.VisualName,
+                        row.VisualType,
+                        row.VisualFilters,
+                        row.PageFilters,
+                        row.ColumnsUsed,
+                        row.MeasuresUsed,
+                        row.Dax));
+                }
+
                 string exportsFolder = Path.Combine(_env.WebRootPath, "Exports");
                 if (!Directory.Exists(exportsFolder)) Directory.CreateDirectory(exportsFolder);
 
-                string fileName = $"DAX_{reportName}_{DateTime.Now:yyyyMMdd_HHmmss}.csv";
+                string fileName = $"DAX_{safeReportName}_{DateTime.Now:yyyyMMdd_HHmmss}.csv";
                 string filePath = Path.Combine(exportsFolder, fileName);
 
                 await File.WriteAllTextAsync(filePath, csvContent.ToString());
@@ -238,7 +223,7 @@ namespace ReportsAutomationApp.Services
                 return new StepResult
                 {
                     IsSuccess = true,
-                    Message = $"Successfully extracted {visualsProcessed} visuals with all Bookmark Date scenarios.",
+                    Message = $"Successfully extracted {visualsProcessed} visuals with all Bookmark Date scenarios. Removed {duplicatesRemoved} duplicate row(s).",
                     DownloadFilePath = $"/Exports/{fileName}",
                     ExtractedDataPreview = csvContent.ToString().Substring(0, Math.Min(csvContent.Length, 500)) + "...\n[Data Truncated]"
                 };
@@ -256,10 +241,54 @@ namespace ReportsAutomationApp.Services
 
         public class BookmarkData
         {
-            public string Name { get; set; }
-            public string PageId { get; set; }
-            public HashSet<string> HiddenVisuals { get; set; } = new HashSet<string>();
+            public string Name { get; set; } = "";
+            public string PageId { get; set; } = "";
+            public bool ApplyOnlyToTargetVisuals { get; set; }
+            public HashSet<string> TargetVisuals { get; set; } = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            public HashSet<string> HiddenVisuals { get; set; } = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             public List<string> Filters { get; set; } = new List<string>();
+        }
+
+        private sealed class ExportRow
+        {
+            public ExportRow(string modelName, string pageName, string visualId, string visualName, string visualType, string visualFilters, string pageFilters, string columnsUsed, string measuresUsed, string dax)
+            {
+                ModelName = modelName;
+                PageName = pageName;
+                VisualId = visualId;
+                VisualName = visualName;
+                VisualType = visualType;
+                VisualFilters = visualFilters;
+                PageFilters = pageFilters;
+                ColumnsUsed = columnsUsed;
+                MeasuresUsed = measuresUsed;
+                Dax = dax;
+            }
+
+            public string ModelName { get; }
+            public string PageName { get; }
+            public string VisualId { get; }
+            public string VisualName { get; }
+            public string VisualType { get; }
+            public string VisualFilters { get; }
+            public string PageFilters { get; }
+            public string ColumnsUsed { get; }
+            public string MeasuresUsed { get; }
+            public string Dax { get; }
+        }
+
+        private sealed class ExportDefinition
+        {
+            public ExportDefinition(string visualName, string measuresUsed, string dax)
+            {
+                VisualName = visualName;
+                MeasuresUsed = measuresUsed;
+                Dax = dax;
+            }
+
+            public string VisualName { get; }
+            public string MeasuresUsed { get; }
+            public string Dax { get; }
         }
 
         private Dictionary<string, string> ExtractReportExtensionsDax(string jsonPath)
@@ -292,6 +321,111 @@ namespace ReportsAutomationApp.Services
             return dict;
         }
 
+        private List<ExportDefinition> BuildExportDefinitions(JsonDocument doc, string visualCategory, string baseVisualName, List<string> seededMeasures, Dictionary<string, string> daxDictionary)
+        {
+            var definitions = new List<ExportDefinition>();
+            var kpiProjections = ExtractKpiProjectionMeasures(doc);
+
+            if (visualCategory == "KPI" && kpiProjections.Count > 1)
+            {
+                foreach (var projection in kpiProjections)
+                {
+                    var exportDefinition = BuildExportDefinition(projection.DisplayName, new List<string> { projection.MeasureName }, daxDictionary);
+                    definitions.Add(exportDefinition);
+                }
+
+                return definitions;
+            }
+
+            definitions.Add(BuildExportDefinition(baseVisualName, seededMeasures, daxDictionary));
+            return definitions;
+        }
+
+        private ExportDefinition BuildExportDefinition(string visualName, List<string> seedMeasures, Dictionary<string, string> daxDictionary)
+        {
+            List<string> measuresUsed = new List<string>();
+            StringBuilder combinedDax = new StringBuilder();
+            HashSet<string> resolvedMeasures = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            Queue<string> measureQueue = new Queue<string>();
+
+            foreach (string seedMeasure in seedMeasures)
+            {
+                if (!daxDictionary.ContainsKey(seedMeasure) || !resolvedMeasures.Add(seedMeasure))
+                    continue;
+
+                measureQueue.Enqueue(seedMeasure);
+                measuresUsed.Add(seedMeasure);
+            }
+
+            while (measureQueue.Count > 0)
+            {
+                string currentMeasure = measureQueue.Dequeue();
+                string currentDax = daxDictionary[currentMeasure];
+
+                combinedDax.AppendLine($"--- {currentMeasure} ---");
+                combinedDax.AppendLine(currentDax);
+                combinedDax.AppendLine();
+
+                var matches = Regex.Matches(currentDax, @"\[([^\]]+)\]");
+                foreach (Match match in matches)
+                {
+                    string nestedItem = match.Groups[1].Value.Trim();
+
+                    if (daxDictionary.ContainsKey(nestedItem) && resolvedMeasures.Add(nestedItem))
+                    {
+                        measureQueue.Enqueue(nestedItem);
+                        measuresUsed.Add(nestedItem);
+                    }
+                }
+            }
+
+            string measuresStr = measuresUsed.Count > 0 ? string.Join("\n", measuresUsed) : "None";
+            string finalDax = combinedDax.ToString().Trim();
+
+            if (string.IsNullOrEmpty(finalDax)) finalDax = "No DAX Formulas";
+
+            return new ExportDefinition(visualName, measuresStr, finalDax);
+        }
+
+        private List<(string DisplayName, string MeasureName)> ExtractKpiProjectionMeasures(JsonDocument doc)
+        {
+            var results = new List<(string DisplayName, string MeasureName)>();
+
+            if (!doc.RootElement.TryGetProperty("visual", out JsonElement visualElement)
+                || !visualElement.TryGetProperty("query", out JsonElement queryElement)
+                || !queryElement.TryGetProperty("queryState", out JsonElement queryStateElement)
+                || !queryStateElement.TryGetProperty("Data", out JsonElement dataElement)
+                || !dataElement.TryGetProperty("projections", out JsonElement projectionsElement)
+                || projectionsElement.ValueKind != JsonValueKind.Array)
+            {
+                return results;
+            }
+
+            foreach (JsonElement projection in projectionsElement.EnumerateArray())
+            {
+                if (!projection.TryGetProperty("field", out JsonElement fieldElement)
+                    || !fieldElement.TryGetProperty("Measure", out JsonElement measureElement)
+                    || !measureElement.TryGetProperty("Property", out JsonElement propertyElement))
+                {
+                    continue;
+                }
+
+                string? measureName = propertyElement.GetString();
+                if (string.IsNullOrWhiteSpace(measureName))
+                    continue;
+
+                string displayName = projection.TryGetProperty("displayName", out JsonElement displayNameElement)
+                    ? displayNameElement.GetString() ?? measureName
+                    : projection.TryGetProperty("nativeQueryRef", out JsonElement nativeQueryRefElement)
+                        ? nativeQueryRefElement.GetString() ?? measureName
+                        : measureName;
+
+                results.Add((displayName, measureName));
+            }
+
+            return results;
+        }
+
         private List<BookmarkData> ExtractAllBookmarks(string bookmarksPath)
         {
             var bookmarks = new List<BookmarkData>();
@@ -310,6 +444,26 @@ namespace ReportsAutomationApp.Services
                     else if (root.TryGetProperty("name", out var internalName))
                         bookmark.Name = internalName.GetString();
 
+                    if (root.TryGetProperty("options", out var options))
+                    {
+                        if (options.TryGetProperty("applyOnlyToTargetVisuals", out var applyOnlyTargetVisuals)
+                            && (applyOnlyTargetVisuals.ValueKind == JsonValueKind.True || applyOnlyTargetVisuals.ValueKind == JsonValueKind.False))
+                        {
+                            bookmark.ApplyOnlyToTargetVisuals = applyOnlyTargetVisuals.GetBoolean();
+                        }
+
+                        if (options.TryGetProperty("targetVisualNames", out var targetVisualNames)
+                            && targetVisualNames.ValueKind == JsonValueKind.Array)
+                        {
+                            foreach (var targetVisualName in targetVisualNames.EnumerateArray())
+                            {
+                                var visualName = targetVisualName.GetString();
+                                if (!string.IsNullOrWhiteSpace(visualName))
+                                    bookmark.TargetVisuals.Add(visualName);
+                            }
+                        }
+                    }
+
                     if (root.TryGetProperty("explorationState", out var expState))
                     {
                         if (expState.TryGetProperty("activeSection", out var activeSec))
@@ -317,6 +471,7 @@ namespace ReportsAutomationApp.Services
 
                         List<string> rawFilters = new List<string>();
                         FindFilters(expState, rawFilters);
+                        ExtractSlicerStateFilters(expState, rawFilters);
                         if (rawFilters.Count > 0)
                             bookmark.Filters = new HashSet<string>(rawFilters).ToList();
                     }
@@ -338,6 +493,9 @@ namespace ReportsAutomationApp.Services
                 {
                     if (prop.Value.ValueKind == JsonValueKind.Object)
                     {
+                        if (IsBookmarkVisualHidden(prop.Value))
+                            hiddenVisuals.Add(prop.Name);
+
                         if (prop.Value.TryGetProperty("isHidden", out JsonElement hiddenEl) && hiddenEl.ValueKind == JsonValueKind.True)
                             hiddenVisuals.Add(prop.Name);
 
@@ -358,7 +516,315 @@ namespace ReportsAutomationApp.Services
             }
         }
 
+        private List<ExportRow> DeduplicateRows(List<ExportRow> rows)
+        {
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            var deduplicated = new List<ExportRow>();
 
+            foreach (var row in rows)
+            {
+                string key = string.Join("\u001F",
+                    NormalizeForDedup(row.ModelName),
+                    NormalizeForDedup(row.PageName),
+                    NormalizeForDedup(row.VisualName),
+                    NormalizeForDedup(row.VisualType),
+                    NormalizeForDedup(row.VisualFilters),
+                    NormalizeForDedup(row.PageFilters),
+                    NormalizeForDedup(row.ColumnsUsed),
+                    NormalizeForDedup(row.MeasuresUsed),
+                    NormalizeForDedup(row.Dax));
+
+                if (seen.Add(key))
+                {
+                    deduplicated.Add(row);
+                }
+            }
+
+            return deduplicated;
+        }
+
+        private static string NormalizeForDedup(string value)
+        {
+            return string.IsNullOrWhiteSpace(value)
+                ? string.Empty
+                : value.Replace("\r\n", "\n", StringComparison.Ordinal).Trim();
+        }
+
+        private static bool IsBookmarkVisualHidden(JsonElement visualState)
+        {
+            if (visualState.TryGetProperty("display", out JsonElement displayState)
+                && displayState.ValueKind == JsonValueKind.Object
+                && displayState.TryGetProperty("mode", out JsonElement displayMode)
+                && string.Equals(displayMode.GetString(), "hidden", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            if (visualState.TryGetProperty("singleVisual", out JsonElement singleVisual)
+                && singleVisual.ValueKind == JsonValueKind.Object
+                && singleVisual.TryGetProperty("display", out JsonElement singleVisualDisplay)
+                && singleVisualDisplay.ValueKind == JsonValueKind.Object
+                && singleVisualDisplay.TryGetProperty("mode", out JsonElement singleVisualMode)
+                && string.Equals(singleVisualMode.GetString(), "hidden", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        private void ExtractSlicerStateFilters(JsonElement element, List<string> filterExpressions)
+        {
+            if (element.ValueKind == JsonValueKind.Object)
+            {
+                if (TryBuildSlicerStateFilter(element, out string slicerFilter)
+                    && !string.IsNullOrWhiteSpace(slicerFilter)
+                    && !filterExpressions.Contains(slicerFilter))
+                {
+                    filterExpressions.Add(slicerFilter);
+                }
+
+                foreach (JsonProperty prop in element.EnumerateObject())
+                {
+                    ExtractSlicerStateFilters(prop.Value, filterExpressions);
+                }
+            }
+            else if (element.ValueKind == JsonValueKind.Array)
+            {
+                foreach (JsonElement item in element.EnumerateArray())
+                {
+                    ExtractSlicerStateFilters(item, filterExpressions);
+                }
+            }
+        }
+
+        private bool TryBuildSlicerStateFilter(JsonElement visualContainerState, out string filterExpression)
+        {
+            filterExpression = "";
+
+            if (!visualContainerState.TryGetProperty("singleVisual", out JsonElement singleVisual)
+                || singleVisual.ValueKind != JsonValueKind.Object
+                || !string.Equals(singleVisual.TryGetProperty("visualType", out JsonElement visualType) ? visualType.GetString() : null, "slicer", StringComparison.OrdinalIgnoreCase)
+                || HasExplicitVisualFilter(singleVisual))
+            {
+                return false;
+            }
+
+            string targetField = ResolveSlicerTargetField(visualContainerState, singleVisual);
+            if (string.IsNullOrWhiteSpace(targetField))
+            {
+                return false;
+            }
+
+            if (!singleVisual.TryGetProperty("objects", out JsonElement objects)
+                || objects.ValueKind != JsonValueKind.Object
+                || !objects.TryGetProperty("merge", out JsonElement merge)
+                || merge.ValueKind != JsonValueKind.Object)
+            {
+                return false;
+            }
+
+            JsonElement dataProperties = GetFirstPropertyBag(merge, "data");
+            JsonElement dateRangeProperties = GetFirstPropertyBag(merge, "dateRange");
+
+            string mode = GetLiteralPropertyValue(dataProperties, "mode");
+            string relativeRange = GetLiteralPropertyValue(dataProperties, "relativeRange");
+            string relativePeriod = GetLiteralPropertyValue(dataProperties, "relativePeriod");
+            string relativeDuration = GetLiteralPropertyValue(dataProperties, "relativeDuration");
+            string startDate = NormalizeDateLiteral(GetLiteralPropertyValue(dataProperties, "startDate"));
+            string endDate = NormalizeDateLiteral(GetLiteralPropertyValue(dataProperties, "endDate"));
+            bool includeToday = string.Equals(GetLiteralPropertyValue(dateRangeProperties, "includeToday"), "true", StringComparison.OrdinalIgnoreCase);
+
+            if (!string.IsNullOrWhiteSpace(relativeRange)
+                && !string.IsNullOrWhiteSpace(relativePeriod)
+                && TryParsePowerBiDuration(relativeDuration, out int durationValue))
+            {
+                string normalizedPeriod = NormalizeRelativePeriod(relativePeriod);
+                string currentDate = includeToday ? "CURRENT_DATE" : "DATEADD(DAY, -1, CURRENT_DATE)";
+
+                if (string.Equals(relativeRange, "Last", StringComparison.OrdinalIgnoreCase))
+                {
+                    filterExpression = $"{targetField} BETWEEN DATEADD({normalizedPeriod}, -{durationValue}, {currentDate}) AND {currentDate}";
+                    return true;
+                }
+
+                if (string.Equals(relativeRange, "Next", StringComparison.OrdinalIgnoreCase))
+                {
+                    string rangeStart = includeToday ? "CURRENT_DATE" : "DATEADD(DAY, 1, CURRENT_DATE)";
+                    filterExpression = $"{targetField} BETWEEN {rangeStart} AND DATEADD({normalizedPeriod}, {durationValue}, {rangeStart})";
+                    return true;
+                }
+
+                if (string.Equals(relativeRange, "This", StringComparison.OrdinalIgnoreCase))
+                {
+                    filterExpression = $"{targetField} IN CURRENT {normalizedPeriod}";
+                    return true;
+                }
+            }
+
+            if (string.Equals(mode, "Between", StringComparison.OrdinalIgnoreCase)
+                && (!string.IsNullOrWhiteSpace(startDate) || !string.IsNullOrWhiteSpace(endDate) || includeToday))
+            {
+                string lowerBound = !string.IsNullOrWhiteSpace(startDate) ? startDate : "MIN_DATE";
+                string upperBound = !string.IsNullOrWhiteSpace(endDate)
+                    ? endDate
+                    : includeToday
+                        ? "CURRENT_DATE"
+                        : "MAX_DATE";
+
+                filterExpression = $"{targetField} BETWEEN {lowerBound} AND {upperBound}";
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool HasExplicitVisualFilter(JsonElement singleVisual)
+        {
+            if (!singleVisual.TryGetProperty("objects", out JsonElement objects)
+                || objects.ValueKind != JsonValueKind.Object
+                || !objects.TryGetProperty("merge", out JsonElement merge)
+                || merge.ValueKind != JsonValueKind.Object
+                || !merge.TryGetProperty("general", out JsonElement general)
+                || general.ValueKind != JsonValueKind.Array)
+            {
+                return false;
+            }
+
+            foreach (JsonElement item in general.EnumerateArray())
+            {
+                if (item.ValueKind == JsonValueKind.Object
+                    && item.TryGetProperty("properties", out JsonElement properties)
+                    && properties.ValueKind == JsonValueKind.Object
+                    && properties.TryGetProperty("filter", out JsonElement filter)
+                    && filter.ValueKind == JsonValueKind.Object)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private string ResolveSlicerTargetField(JsonElement visualContainerState, JsonElement singleVisual)
+        {
+            if (visualContainerState.TryGetProperty("filters", out JsonElement filters)
+                && filters.ValueKind == JsonValueKind.Object
+                && filters.TryGetProperty("byExpr", out JsonElement byExpr)
+                && byExpr.ValueKind == JsonValueKind.Array)
+            {
+                foreach (JsonElement item in byExpr.EnumerateArray())
+                {
+                    if (item.ValueKind == JsonValueKind.Object
+                        && item.TryGetProperty("expression", out JsonElement expression))
+                    {
+                        string propertyPath = GetPropertyPath(expression);
+                        if (!string.IsNullOrWhiteSpace(propertyPath))
+                        {
+                            return propertyPath;
+                        }
+                    }
+                }
+            }
+
+            if (singleVisual.TryGetProperty("activeProjections", out JsonElement activeProjections)
+                && activeProjections.ValueKind == JsonValueKind.Object)
+            {
+                foreach (JsonProperty projection in activeProjections.EnumerateObject())
+                {
+                    if (projection.Value.ValueKind != JsonValueKind.Array)
+                        continue;
+
+                    foreach (JsonElement item in projection.Value.EnumerateArray())
+                    {
+                        string propertyPath = GetPropertyPath(item);
+                        if (!string.IsNullOrWhiteSpace(propertyPath))
+                        {
+                            return propertyPath;
+                        }
+                    }
+                }
+            }
+
+            return "";
+        }
+
+        private static JsonElement GetFirstPropertyBag(JsonElement merge, string propertyName)
+        {
+            if (merge.TryGetProperty(propertyName, out JsonElement propertyArray)
+                && propertyArray.ValueKind == JsonValueKind.Array)
+            {
+                foreach (JsonElement item in propertyArray.EnumerateArray())
+                {
+                    if (item.ValueKind == JsonValueKind.Object
+                        && item.TryGetProperty("properties", out JsonElement properties)
+                        && properties.ValueKind == JsonValueKind.Object)
+                    {
+                        return properties;
+                    }
+                }
+            }
+
+            return default;
+        }
+
+        private static string GetLiteralPropertyValue(JsonElement propertyBag, string propertyName)
+        {
+            if (propertyBag.ValueKind == JsonValueKind.Object
+                && propertyBag.TryGetProperty(propertyName, out JsonElement property)
+                && property.ValueKind == JsonValueKind.Object
+                && property.TryGetProperty("expr", out JsonElement expr)
+                && expr.ValueKind == JsonValueKind.Object
+                && expr.TryGetProperty("Literal", out JsonElement literal)
+                && literal.ValueKind == JsonValueKind.Object
+                && literal.TryGetProperty("Value", out JsonElement value))
+            {
+                return TrimPowerBiLiteral(value.GetString());
+            }
+
+            return "";
+        }
+
+        private static string TrimPowerBiLiteral(string value)
+        {
+            return string.IsNullOrWhiteSpace(value) ? "" : value.Trim(' ', '\'', '"');
+        }
+
+        private static bool TryParsePowerBiDuration(string duration, out int value)
+        {
+            value = 0;
+            if (string.IsNullOrWhiteSpace(duration))
+                return false;
+
+            return int.TryParse(duration.TrimEnd('D'), out value);
+        }
+
+        private static string NormalizeRelativePeriod(string period)
+        {
+            return period.TrimEnd('s', 'S') switch
+            {
+                "Day" => "DAY",
+                "Week" => "WEEK",
+                "Month" => "MONTH",
+                "Quarter" => "QUARTER",
+                "Year" => "YEAR",
+                _ => period.ToUpperInvariant()
+            };
+        }
+
+        private static string NormalizeDateLiteral(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return "";
+
+            const string prefix = "datetime'";
+            if (value.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) && value.EndsWith("'", StringComparison.Ordinal))
+            {
+                return $"'{value.Substring(prefix.Length, value.Length - prefix.Length - 1).Split('T')[0]}'";
+            }
+
+            return value.StartsWith("'", StringComparison.Ordinal) ? value : $"'{value}'";
+        }
         // =========================================================
         // POWER BI AST FILTER PARSER 
         // =========================================================

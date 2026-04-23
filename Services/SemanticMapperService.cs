@@ -26,6 +26,7 @@ namespace ReportsAutomationApp.Services
             try
             {
                 string modelName = new DirectoryInfo(semanticModelPath).Name;
+                string safeModelName = ExportFileNameHelper.ToSafeToken(modelName);
                 string definitionPath = Path.Combine(semanticModelPath, "definition");
 
                 if (!Directory.Exists(definitionPath))
@@ -38,7 +39,7 @@ namespace ReportsAutomationApp.Services
                 string exportsFolder = Path.Combine(_env.WebRootPath, "Exports");
                 if (!Directory.Exists(exportsFolder)) Directory.CreateDirectory(exportsFolder);
 
-                string fileName = $"SemanticMap_{modelName}_{DateTime.Now:yyyyMMdd_HHmmss}.txt";
+                string fileName = $"SemanticMap_{safeModelName}_{DateTime.Now:yyyyMMdd_HHmmss}.txt";
                 string filePath = Path.Combine(exportsFolder, fileName);
 
                 await File.WriteAllTextAsync(filePath, contextText);
@@ -58,18 +59,17 @@ namespace ReportsAutomationApp.Services
         }
 
         // ==========================================
-        // CORE LOGIC (Integrated from your original code)
+        // SNOWFLAKE OPTIMIZED CORE LOGIC 
         // ==========================================
         private async Task<string> GenerateModelContextAsync(string semanticModelDefinitionPath, string modelName)
         {
             StringBuilder context = new StringBuilder();
             context.AppendLine($"### SEMANTIC MODEL: {modelName}\n");
-            context.AppendLine("STRICT PHYSICAL MAPPING (CRITICAL: USE THESE NAMES):");
+            context.AppendLine("STRICT PHYSICAL MAPPING (CRITICAL: USE THESE NAMES IN SNOWFLAKE SQL):");
 
             var tableMappings = new Dictionary<string, TableInfo>(StringComparer.OrdinalIgnoreCase);
             var relationships = new List<RelationshipInfo>();
 
-            // Traverse all TMDL files in the definition folder (tables, relationships, etc.)
             string[] tmdlFiles = Directory.GetFiles(semanticModelDefinitionPath, "*.tmdl", SearchOption.AllDirectories);
 
             foreach (string file in tmdlFiles)
@@ -82,38 +82,46 @@ namespace ReportsAutomationApp.Services
                 {
                     TableInfo info = new TableInfo { DaxName = fileName };
 
-                    // Priority 1 & 2: Extract Schema
-                    var schemaMatch = Regex.Match(fileContent, @"Schema\s*=\s*""([^""]+)""", RegexOptions.IgnoreCase);
-                    if (schemaMatch.Success)
+                    // 1. SNOWFLAKE SPECIFIC EXTRACTION (Highest Priority)
+                    var sfSchemaMatch = Regex.Match(fileContent, @"\[Name\s*=\s*""([^""]+)""\s*,\s*Kind\s*=\s*""Schema""\]", RegexOptions.IgnoreCase);
+                    var sfViewMatch = Regex.Match(fileContent, @"\[Name\s*=\s*""([^""]+)""\s*,\s*Kind\s*=\s*""(?:View|Table)""\]", RegexOptions.IgnoreCase);
+
+                    if (sfSchemaMatch.Success) info.PhysicalSchema = sfSchemaMatch.Groups[1].Value;
+                    if (sfViewMatch.Success) info.PhysicalTableName = sfViewMatch.Groups[1].Value;
+
+                    // 2. STANDARD SQL/ODATA FALLBACKS (If not Snowflake)
+                    if (string.IsNullOrEmpty(info.PhysicalSchema))
                     {
-                        info.PhysicalSchema = schemaMatch.Groups[1].Value;
-                    }
-                    else if (Regex.IsMatch(fileContent, @"\bCWS\b", RegexOptions.IgnoreCase))
-                    {
-                        info.PhysicalSchema = "CWS";
-                    }
-                    else
-                    {
-                        var prefixMatch = Regex.Match(fileContent, @"(\w+)\.(Item|Entity|Table)", RegexOptions.IgnoreCase);
-                        if (prefixMatch.Success) info.PhysicalSchema = prefixMatch.Groups[1].Value;
+                        var schemaMatch = Regex.Match(fileContent, @"Schema\s*=\s*""([^""]+)""", RegexOptions.IgnoreCase);
+                        if (schemaMatch.Success) info.PhysicalSchema = schemaMatch.Groups[1].Value;
+                        else if (Regex.IsMatch(fileContent, @"\bCWS\b", RegexOptions.IgnoreCase)) info.PhysicalSchema = "CWS";
                     }
 
-                    // Extract Physical Table Name (Item or Entity)
-                    var itemMatch = Regex.Match(fileContent, @"Item\s*=\s*""([^""]+)""", RegexOptions.IgnoreCase);
-                    var entityMatch = Regex.Match(fileContent, @"Entity\s*=\s*""([^""]+)""", RegexOptions.IgnoreCase);
+                    if (string.IsNullOrEmpty(info.PhysicalTableName))
+                    {
+                        var itemMatch = Regex.Match(fileContent, @"Item\s*=\s*""([^""]+)""", RegexOptions.IgnoreCase);
+                        var entityMatch = Regex.Match(fileContent, @"Entity\s*=\s*""([^""]+)""", RegexOptions.IgnoreCase);
 
-                    if (itemMatch.Success) info.PhysicalTableName = itemMatch.Groups[1].Value;
-                    else if (entityMatch.Success) info.PhysicalTableName = entityMatch.Groups[1].Value;
+                        if (itemMatch.Success) info.PhysicalTableName = itemMatch.Groups[1].Value;
+                        else if (entityMatch.Success) info.PhysicalTableName = entityMatch.Groups[1].Value;
+                    }
 
-                    // Fallbacks
-                    if (string.IsNullOrEmpty(info.PhysicalSchema)) info.PhysicalSchema = "dbo";
+                    // 3. ABSOLUTE FALLBACK (Snowflake Default)
+                    if (string.IsNullOrEmpty(info.PhysicalSchema)) info.PhysicalSchema = "VIEWS"; // Fixed from "dbo"
                     if (string.IsNullOrEmpty(info.PhysicalTableName)) info.PhysicalTableName = fileName;
 
-                    // Extract Columns mapping (DAX Name -> Source Column)
+                    // 4. EXTRACT COLUMNS (DAX -> SQL)
                     var columnMatches = Regex.Matches(fileContent, @"column\s+'?([^'\r\n]+)'?[\s\S]*?sourceColumn:\s*([^\r\n]+)");
                     foreach (Match col in columnMatches)
                     {
                         info.Columns.Add($"'{col.Groups[1].Value.Trim()}' -> {col.Groups[2].Value.Trim()}");
+                    }
+
+                    // 5. EXTRACT MEASURES (Tells the AI which table a measure belongs to)
+                    var measureMatches = Regex.Matches(fileContent, @"^\s*measure\s+'?([^'=]+)'?\s*=", RegexOptions.Multiline);
+                    foreach (Match m in measureMatches)
+                    {
+                        info.Measures.Add(m.Groups[1].Value.Trim());
                     }
 
                     tableMappings[fileName] = info;
@@ -137,21 +145,36 @@ namespace ReportsAutomationApp.Services
             foreach (var kvp in tableMappings)
             {
                 var t = kvp.Value;
-                context.AppendLine($"- DAX Table '{t.DaxName}' -> SQL Table: [{t.PhysicalSchema}].[{t.PhysicalTableName}]");
+
+                // Formats Snowflake physical path properly (e.g. QA_EDW.VIEWS.VW_MERGED_...)
+                string physicalPath = t.PhysicalSchema.Equals("VIEWS", StringComparison.OrdinalIgnoreCase)
+                    ? $"QA_EDW.VIEWS.{t.PhysicalTableName}"
+                    : $"[{t.PhysicalSchema}].[{t.PhysicalTableName}]";
+
+                context.AppendLine($"- DAX Table '{t.DaxName}' -> SQL Table: {physicalPath}");
 
                 if (t.Columns.Count > 0)
                 {
                     context.AppendLine($"  Columns (DAX -> SQL): {string.Join(", ", t.Columns)}");
                 }
+
+                if (t.Measures.Count > 0)
+                {
+                    context.AppendLine($"  Homed Measures: [{string.Join("], [", t.Measures)}]");
+                }
+                context.AppendLine();
             }
 
             // Build Context String for Relationships
-            context.AppendLine("\nRELATIONSHIPS (JOIN KEYS):");
+            context.AppendLine("RELATIONSHIPS (JOIN KEYS):");
             foreach (var rel in relationships)
             {
                 if (tableMappings.TryGetValue(rel.FromTable, out var fromInfo) && tableMappings.TryGetValue(rel.ToTable, out var toInfo))
                 {
-                    context.AppendLine($"- Join: [{fromInfo.PhysicalSchema}].[{fromInfo.PhysicalTableName}].[{rel.FromColumn}] = [{toInfo.PhysicalSchema}].[{toInfo.PhysicalTableName}].[{rel.ToColumn}]");
+                    string fromPath = fromInfo.PhysicalSchema.Equals("VIEWS", StringComparison.OrdinalIgnoreCase) ? $"QA_EDW.VIEWS.{fromInfo.PhysicalTableName}" : $"[{fromInfo.PhysicalSchema}].[{fromInfo.PhysicalTableName}]";
+                    string toPath = toInfo.PhysicalSchema.Equals("VIEWS", StringComparison.OrdinalIgnoreCase) ? $"QA_EDW.VIEWS.{toInfo.PhysicalTableName}" : $"[{toInfo.PhysicalSchema}].[{toInfo.PhysicalTableName}]";
+
+                    context.AppendLine($"- Join: {fromPath}.[{rel.FromColumn}] = {toPath}.[{rel.ToColumn}]");
                 }
             }
 
@@ -165,6 +188,7 @@ namespace ReportsAutomationApp.Services
             public string PhysicalTableName { get; set; } = "";
             public string PhysicalSchema { get; set; } = "";
             public List<string> Columns { get; set; } = new List<string>();
+            public List<string> Measures { get; set; } = new List<string>(); // Added Measures List
         }
 
         private class RelationshipInfo

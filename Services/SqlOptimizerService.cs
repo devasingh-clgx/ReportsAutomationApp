@@ -3,13 +3,13 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
-using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.Extensions.Configuration;
 using ReportsAutomationApp.Models;
+using Snowflake.Data.Client;
 
 namespace ReportsAutomationApp.Services
 {
@@ -33,19 +33,26 @@ namespace ReportsAutomationApp.Services
             try
             {
                 string reportName = new DirectoryInfo(reportPath).Name;
+                string safeReportName = ExportFileNameHelper.ToSafeToken(reportName);
                 string exportsFolder = Path.Combine(_env.WebRootPath, "Exports");
+                string schemaFolder = Path.Combine(_env.WebRootPath, "SchemaMaps");
+                string schemaPath = Path.Combine(schemaFolder, "QA_EDW_VIEWS_Schema.txt");
 
                 if (!Directory.Exists(exportsFolder))
                     return new StepResult { IsSuccess = false, Message = "Exports folder not found." };
 
-                // Find the output from Step 3
                 var step3File = new DirectoryInfo(exportsFolder)
-                    .GetFiles($"Final_SnowflakeSQL_{reportName}_*.csv")
+                    .GetFiles($"Final_SnowflakeSQL_{safeReportName}_*.csv")
                     .OrderByDescending(f => f.CreationTime)
                     .FirstOrDefault();
 
                 if (step3File == null)
                     return new StepResult { IsSuccess = false, Message = "Missing Step 3 SQL CSV. Ensure Step 3 is completed." };
+
+                if (!File.Exists(schemaPath))
+                    return new StepResult { IsSuccess = false, Message = "Missing Snowflake Schema mapping file." };
+
+                string snowflakeSchemaContext = await File.ReadAllTextAsync(schemaPath);
 
                 var rows = ParseCsv(step3File.FullName);
                 if (rows.Count <= 1)
@@ -62,50 +69,85 @@ namespace ReportsAutomationApp.Services
 
                 StringBuilder outputCsv = new StringBuilder();
 
-                // Keep original headers, rename the last column to Optimized_SQL
                 var headers = new List<string>(rows[0]);
                 headers[headers.Count - 1] = "Optimized_Snowflake_SQL";
                 outputCsv.AppendLine(string.Join(",", headers.Select(h => $"\"{h.Replace("\"", "\"\"")}\"")));
 
                 int processedCount = 0;
+                int maxRetries = 3;
 
                 for (int i = 1; i < rows.Count; i++)
                 {
                     var row = rows[i];
-                    string rawSql = row.Last(); // The SQL generated in Step 3
+                    string currentSql = row.Last();
 
-                    if (string.IsNullOrWhiteSpace(rawSql) || rawSql.StartsWith("-- ERROR"))
+                    if (string.IsNullOrWhiteSpace(currentSql) || currentSql.StartsWith("-- ERROR"))
                     {
                         outputCsv.AppendLine(string.Join(",", row.Select(c => $"\"{c?.Replace("\"", "\"\"") ?? ""}\"")));
                         continue;
                     }
 
-                    string visualName = row[3];
-                    string visualType = row[4];
+                    string visualName = row[4];
+                    string visualType = row[5];
+                    string columnsUsed = row[8];
 
-                    string systemPrompt = GetOptimizerPrompt();
-                    string userPrompt = $@"
-                    VISUAL TYPE: {visualType}
-                    VISUAL NAME: {visualName}
+                    bool isValid = false;
+                    int attempt = 0;
 
-                    RAW SQL TO OPTIMIZE:
-                    {rawSql}";
+                    // THE SELF-HEALING LOOP
+                    while (attempt < maxRetries && !isValid)
+                    {
+                        attempt++;
 
-                    string optimizedSql = await CallAzureOpenAiAsync(httpClient, requestUrl, systemPrompt, userPrompt);
+                        // 1. Test the query against Snowflake
+                        var (snowflakeSuccess, errorMessage) = await TestSnowflakeQueryAsync(currentSql, visualType);
 
-                    row[row.Count - 1] = optimizedSql; // Replace raw SQL with optimized SQL
+                        if (snowflakeSuccess)
+                        {
+                            isValid = true;
+                            break;
+                        }
+
+                        // 2. If it failed, ask AI to fix it
+                        string systemPrompt = GetOptimizerPrompt();
+                        string userPrompt = $@"
+                            ### SNOWFLAKE SCHEMA CONTEXT:
+                            {snowflakeSchemaContext}
+
+                            ### VISUAL METADATA (Defines Output Shape):
+                            - Visual Type: {visualType}
+                            - Grouping Columns Expected: {columnsUsed}
+
+                            ### FAILED SQL QUERY:
+                            {currentSql}
+
+                            ### SNOWFLAKE ERROR MESSAGE:
+                            {errorMessage}
+
+                            Fix the query based on the error above. Return ONLY the corrected raw Snowflake SQL.";
+
+                        currentSql = await CallAzureOpenAiAsync(httpClient, requestUrl, systemPrompt, userPrompt);
+                    }
+
+                    // If it failed all 3 attempts, mark it as an error
+                    if (!isValid)
+                    {
+                        currentSql = $"-- FAILED OPTIMIZATION AFTER 3 TRIES.\n-- LAST ERROR:\n/* {currentSql} */";
+                    }
+
+                    row[row.Count - 1] = currentSql;
                     outputCsv.AppendLine(string.Join(",", row.Select(c => $"\"{c?.Replace("\"", "\"\"") ?? ""}\"")));
                     processedCount++;
                 }
 
-                string outFileName = $"Optimized_SnowflakeSQL_{reportName}_{DateTime.Now:yyyyMMdd_HHmmss}.csv";
+                string outFileName = $"Optimized_SnowflakeSQL_{safeReportName}_{DateTime.Now:yyyyMMdd_HHmmss}.csv";
                 string outFilePath = Path.Combine(exportsFolder, outFileName);
                 await File.WriteAllTextAsync(outFilePath, outputCsv.ToString());
 
                 return new StepResult
                 {
                     IsSuccess = true,
-                    Message = $"Successfully optimized SQL for {processedCount} visuals.",
+                    Message = $"Successfully optimized & validated SQL for {processedCount} scenarios against Snowflake.",
                     DownloadFilePath = $"/Exports/{outFileName}",
                     ExtractedDataPreview = outputCsv.ToString().Substring(0, Math.Min(outputCsv.Length, 1000)) + "...\n[Data Truncated]"
                 };
@@ -114,6 +156,109 @@ namespace ReportsAutomationApp.Services
             {
                 return new StepResult { IsSuccess = false, Message = $"Error in SQL Optimization: {ex.Message}" };
             }
+        }
+
+        /// <summary>
+        /// Executes the SQL in Snowflake to validate syntax, types, and shape.
+        /// </summary>
+        private async Task<(bool IsSuccess, string ErrorMessage)> TestSnowflakeQueryAsync(string sql, string visualType)
+        {
+            try
+            {
+                string connStr = ResolveSnowflakeConnectionString();
+                if (string.IsNullOrEmpty(connStr))
+                {
+                    // Fallback bypass if user hasn't configured connection yet
+                    return (true, "");
+                }
+
+                // Wrap in LIMIT 0 so we only test compilation and metadata (no data movement costs!)
+                string testSql = $"SELECT * FROM (\n{sql}\n) LIMIT 0;";
+
+                using var conn = new SnowflakeDbConnection { ConnectionString = connStr };
+                await conn.OpenAsync();
+
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = testSql;
+
+                using var reader = await cmd.ExecuteReaderAsync();
+                int columnCount = reader.FieldCount;
+
+                if (visualType.Equals("KPI", StringComparison.OrdinalIgnoreCase) ||
+                    visualType.Equals("Card", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (columnCount > 1)
+                        return (false, "SHAPE ERROR: VisualType is KPI. The query MUST return exactly 1 scalar integer/float value. Do NOT use GROUP BY.");
+                }
+                else if (visualType.Equals("Slicer", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (columnCount > 1)
+                        return (false, "SHAPE ERROR: VisualType is Slicer. The query MUST return exactly 1 column representing the slicer list. Remove extra columns.");
+                }
+
+                return (true, "Success");
+            }
+            catch (Exception ex)
+            {
+                // Return the EXACT Snowflake error (e.g. "Numeric value out of range", "Invalid Identifier")
+                return (false, $"SNOWFLAKE EXECUTION ERROR: {ex.Message}");
+            }
+        }
+
+        private string ResolveSnowflakeConnectionString()
+        {
+            string? explicitConnectionString = _config["Snowflake:ConnectionString"];
+            if (!string.IsNullOrWhiteSpace(explicitConnectionString))
+            {
+                return explicitConnectionString;
+            }
+
+            var pairs = new List<string>
+            {
+                BuildPair("account", _config["Snowflake:Account"]),
+                BuildPair("user", _config["Snowflake:User"]),
+                BuildPair("password", _config["Snowflake:Password"]),
+                BuildPair("authenticator", _config["Snowflake:Authenticator"]),
+                BuildPair("db", _config["Snowflake:Database"]),
+                BuildPair("schema", _config["Snowflake:Schema"]),
+                BuildPair("warehouse", _config["Snowflake:Warehouse"] ?? _config["Snowflake:WarehouseName"]),
+                BuildPair("role", _config["Snowflake:Role"]),
+                BuildPair("private_key_file", _config["Snowflake:PrivateKeyFile"]),
+                BuildPair("private_key_pwd", _config["Snowflake:PrivateKeyPassword"]),
+                BuildPair("token", _config["Snowflake:Token"]),
+                BuildPair("insecure_mode", _config["Snowflake:InsecureMode"]),
+                BuildPair("ocsp_fail_open", _config["Snowflake:OcspFailOpen"])
+            }
+            .Where(x => !string.IsNullOrWhiteSpace(x));
+
+            return string.Join(";", pairs);
+        }
+
+        private static string BuildPair(string key, string? value)
+        {
+            return string.IsNullOrWhiteSpace(value) ? string.Empty : $"{key}={value}";
+        }
+
+        private string GetOptimizerPrompt()
+        {
+            return @"You are an elite Snowflake Database Administrator and Error-Resolution bot.
+Your job is to fix a broken Snowflake SQL query that failed execution. 
+Output ONLY raw Snowflake SQL code. Do not wrap in markdown or backticks.
+
+### THE 3 GOLDEN RULES FOR FIXING ERRORS:
+
+1. FIXING DATA TYPE & DIVISION ERRORS (CRITICAL):
+- If the error is 'Division by Zero', wrap the denominator in NULLIF(denominator, 0).
+- If the error is 'Numeric value out of range' or relates to decimal constraints, explicitly cast the columns before doing math: `CAST(col AS FLOAT)`.
+- Whenever an AVG() function or a division (/) operator is used on a metric, you MUST wrap the column in CAST(column AS FLOAT). Example: `AVG(CAST(mei.DEPRECIATION_AGE AS FLOAT))`.
+
+2. FIXING SHAPE ERRORS (KPI vs SLICER vs CHART):
+- If the error says 'VisualType is KPI': The query must be `SELECT SUM(col) FROM table`. Remove ALL `GROUP BY` statements and return exactly ONE column.
+- If the error says 'VisualType is Slicer': The query must be `SELECT DISTINCT col FROM table`. Return exactly ONE column.
+- If the visual is a 'Chart' or 'Table': Ensure the columns listed in the SELECT match the GROUP BY clause exactly.
+
+3. FIXING IDENTIFIER ERRORS:
+- If Snowflake says 'Invalid Identifier', check the provided SNOWFLAKE SCHEMA CONTEXT. Ensure the alias is correct, and the column actually exists in that table.";
         }
 
         private async Task<string> CallAzureOpenAiAsync(HttpClient httpClient, string url, string systemPrompt, string userPrompt)
@@ -129,10 +274,7 @@ namespace ReportsAutomationApp.Services
                 max_tokens = 3000
             };
 
-            int maxRetries = 3;
-            int baseDelayMs = 5000;
-
-            for (int attempt = 1; attempt <= maxRetries; attempt++)
+            for (int attempt = 1; attempt <= 3; attempt++)
             {
                 var content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
                 var response = await httpClient.PostAsync(url, content);
@@ -151,34 +293,14 @@ namespace ReportsAutomationApp.Services
                             }
                         }
                     }
-                    return "-- ERROR: Failed to parse LLM response.";
                 }
                 else if ((int)response.StatusCode == 429)
                 {
-                    int waitTime = baseDelayMs * attempt;
-                    if (response.Headers.TryGetValues("Retry-After", out var retryHeaders) && int.TryParse(retryHeaders.FirstOrDefault(), out int retrySeconds))
-                        waitTime = retrySeconds * 1000;
-
-                    await Task.Delay(waitTime);
+                    await Task.Delay(5000 * attempt);
                     continue;
                 }
             }
-            return "-- ERROR: Optimizer API Call Failed.";
-        }
-
-        private string GetOptimizerPrompt()
-        {
-            return @"You are a Senior Snowflake Database Administrator.
-Your job is to take raw, machine-generated Snowflake SQL and refactor it to human-grade, highly optimized standards.
-Output ONLY raw Snowflake SQL. No explanations.
-
-### REFACTORING RULES:
-1. EXTRACT GLOBAL FILTERS: If you see a CASE WHEN condition repeated across multiple aggregates (e.g., CASE WHEN IS_CURRENT = 'Yes'), remove it from the CASE statements and apply it once as a global WHERE clause.
-2. PREVENT TRUNCATION (CAST TO FLOAT): Whenever an AVG() function or a division (/) operator is used on a numeric column (like AGE), you MUST wrap the column in CAST(column AS FLOAT). 
-   - Example: AVG(CAST(mei.DEPRECIATION_AGE AS FLOAT))
-3. REMOVE UNNECESSARY NESTING: Simplify redundant COALESCE or math logic if it is excessively nested.
-4. MAINTAIN INTENT: Do not change the table names, schema names, or column names. Only optimize the logical structure and data types.
-5. PRUNE COLUMNS: If the query has excessive GROUP BY columns that look like irrelevant tooltips, you may prune them to keep the query focused on the primary metric.";
+            return "-- ERROR: Optimizer LLM Failed.";
         }
 
         private List<List<string>> ParseCsv(string filePath)

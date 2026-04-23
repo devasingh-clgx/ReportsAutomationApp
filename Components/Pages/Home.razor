@@ -4,6 +4,7 @@
 @using ReportsAutomationApp.Services
 @using Microsoft.AspNetCore.Components.Forms
 @using Microsoft.AspNetCore.Hosting
+@using System.Text.Json
 @inject IConfiguration Config
 @inject ExtractionOrchestrator Orchestrator
 @inject IWebHostEnvironment Env
@@ -227,6 +228,7 @@
             var smDirs = Directory.GetDirectories(semanticModelsDir);
             foreach (var smPath in smDirs)
             {
+                // We could do the same .platform extraction for Semantic Models here if needed!
                 semanticModels.Add(new SemanticModelUI { Name = Path.GetFileName(smPath), FullPath = smPath });
             }
         }
@@ -241,9 +243,35 @@
                 
                 foreach (var repPath in actualReportFolders)
                 {
+                    // Default to the folder name (GUID)
+                    string finalReportName = Path.GetFileName(repPath);
+                    
+                    // Attempt to read the human-readable name from .platform
+                    string platformFilePath = Path.Combine(repPath, ".platform");
+                    if (File.Exists(platformFilePath))
+                    {
+                        try
+                        {
+                            string platformJson = File.ReadAllText(platformFilePath);
+                            using (JsonDocument doc = JsonDocument.Parse(platformJson))
+                            {
+                                if (doc.RootElement.TryGetProperty("metadata", out JsonElement metadata) &&
+                                    metadata.TryGetProperty("displayName", out JsonElement displayName))
+                                {
+                                    string extractedName = displayName.GetString();
+                                    if (!string.IsNullOrWhiteSpace(extractedName))
+                                    {
+                                        finalReportName = extractedName.Trim();
+                                    }
+                                }
+                            }
+                        }
+                        catch { /* Ignore JSON parsing errors and use the default GUID name */ }
+                    }
+
                     groupUI.Reports.Add(new ReportUI
                     {
-                        ReportName = Path.GetFileName(repPath),
+                        ReportName = finalReportName,
                         ReportFullPath = repPath,
                         IsSelected = false
                     });
@@ -253,7 +281,6 @@
             }
         }
     }
-
     private async Task RunNextStep(ReportUI report)
     {
         if (string.IsNullOrEmpty(report.SelectedSemanticModelPath) || report.CompletedStep >= 4) return;
