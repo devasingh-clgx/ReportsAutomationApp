@@ -1,0 +1,297 @@
+@page "/snowflake-lab"
+@using System.Data
+@using System.IO
+@using Snowflake.Data.Client
+@inject IConfiguration Config
+@inject IWebHostEnvironment Env
+
+<PageTitle>Snowflake Connection Lab</PageTitle>
+
+<div class="container-fluid mt-4">
+    <h4 class="mb-3">❄️ Snowflake Connection Lab</h4>
+    <p class="text-muted">Use these tests to validate different Snowflake auth/connection modes and AVD file-write behavior.</p>
+
+    <div class="row g-2 mb-3">
+        <div class="col-md-3"><button class="btn btn-outline-primary w-100" @onclick="TestBaseConnectionAsync" disabled="@isRunning">1) Base Connection</button></div>
+        <div class="col-md-3"><button class="btn btn-outline-primary w-100" @onclick="TestPasswordAuthAsync" disabled="@isRunning">2) Password Auth</button></div>
+        <div class="col-md-3"><button class="btn btn-outline-primary w-100" @onclick="TestExternalBrowserAuthAsync" disabled="@isRunning">3) External Browser</button></div>
+        <div class="col-md-3"><button class="btn btn-outline-primary w-100" @onclick="TestPingSsoAsync" disabled="@isRunning">4) Ping/SSO Auth</button></div>
+
+        <div class="col-md-3"><button class="btn btn-outline-secondary w-100" @onclick="TestKeyPairAsync" disabled="@isRunning">5) Key Pair</button></div>
+        <div class="col-md-3"><button class="btn btn-outline-secondary w-100" @onclick="TestSessionContextAsync" disabled="@isRunning">6) Session Context</button></div>
+        <div class="col-md-3"><button class="btn btn-outline-secondary w-100" @onclick="TestCortexAsync" disabled="@isRunning">7) Cortex Query</button></div>
+        <div class="col-md-3"><button class="btn btn-outline-secondary w-100" @onclick="TestParallelConnectionsAsync" disabled="@isRunning">8) Parallel (x5)</button></div>
+
+        <div class="col-md-3"><button class="btn btn-outline-dark w-100" @onclick="TestExportWriteAsync" disabled="@isRunning">9) Exports Write Test</button></div>
+        <div class="col-md-3"><button class="btn btn-outline-dark w-100" @onclick="InspectConfigAsync" disabled="@isRunning">10) Config Summary</button></div>
+    </div>
+
+    @if (isRunning)
+    {
+        <div class="alert alert-info">Running test...</div>
+    }
+
+    @if (!string.IsNullOrWhiteSpace(resultLog))
+    {
+        <pre class="bg-light border rounded p-3" style="white-space: pre-wrap; max-height: 520px; overflow-y: auto;">@resultLog</pre>
+    }
+</div>
+
+@code {
+    private bool isRunning;
+    private string resultLog = "";
+
+    private async Task TestBaseConnectionAsync() => await RunScenarioAsync("Base Connection", async () =>
+    {
+        string connString = ResolveBaseConnectionString();
+        using var conn = new SnowflakeDbConnection { ConnectionString = connString };
+        await conn.OpenAsync();
+        return "Connected successfully using base connection string.";
+    });
+
+    private async Task TestPasswordAuthAsync() => await RunScenarioAsync("Password Auth", async () =>
+    {
+        if (string.IsNullOrWhiteSpace(Config["Snowflake:Password"]))
+        {
+            throw new InvalidOperationException("Password auth is not configured. This environment appears to use SSO/Ping.");
+        }
+
+        string conn = ResolveBaseConnectionString();
+        conn = Upsert(conn, "authenticator", "snowflake");
+        conn = Upsert(conn, "password", Config["Snowflake:Password"]);
+
+        using var db = new SnowflakeDbConnection { ConnectionString = conn };
+        await db.OpenAsync();
+        return "Connected using password auth.";
+    });
+
+    private async Task TestExternalBrowserAuthAsync() => await RunScenarioAsync("External Browser Auth", async () =>
+    {
+        string conn = ResolveBaseConnectionString();
+        conn = Upsert(conn, "authenticator", "externalbrowser");
+        conn = Remove(conn, "password");
+        conn = Remove(conn, "token");
+
+        using var db = new SnowflakeDbConnection { ConnectionString = conn };
+        await db.OpenAsync();
+        return "Connected using external browser auth.";
+    });
+
+    private async Task TestPingSsoAsync() => await RunScenarioAsync("Ping/SSO Auth", async () =>
+    {
+        string conn = ResolveBaseConnectionString();
+        string configuredAuthenticator = Config["Snowflake:Authenticator"];
+
+        if (string.IsNullOrWhiteSpace(configuredAuthenticator))
+        {
+            var map = ParseConnectionString(conn);
+            map.TryGetValue("authenticator", out configuredAuthenticator);
+        }
+
+        if (string.IsNullOrWhiteSpace(configuredAuthenticator))
+        {
+            throw new InvalidOperationException("SSO authenticator is not configured. Set Snowflake:Authenticator (for example, externalbrowser or your Ping IdP URL).");
+        }
+
+        conn = Upsert(conn, "authenticator", configuredAuthenticator);
+        conn = Remove(conn, "token");
+        conn = Remove(conn, "password");
+
+        using var db = new SnowflakeDbConnection { ConnectionString = conn };
+        await db.OpenAsync();
+        return $"Connected using SSO authenticator '{configuredAuthenticator}'.";
+    });
+
+    private async Task TestKeyPairAsync() => await RunScenarioAsync("Key Pair (JWT)", async () =>
+    {
+        string privateKeyFile = Config["Snowflake:PrivateKeyFile"];
+        if (string.IsNullOrWhiteSpace(privateKeyFile))
+        {
+            return "Missing Snowflake:PrivateKeyFile in configuration.";
+        }
+
+        string conn = ResolveBaseConnectionString();
+        conn = Upsert(conn, "authenticator", "snowflake_jwt");
+        conn = Upsert(conn, "private_key_file", privateKeyFile);
+        conn = Upsert(conn, "private_key_pwd", Config["Snowflake:PrivateKeyPassword"]);
+        conn = Remove(conn, "password");
+
+        await using var db = new SnowflakeDbConnection { ConnectionString = conn };
+        await db.OpenAsync();
+        return "Connected using key pair auth.";
+    });
+
+    private async Task TestSessionContextAsync() => await RunScenarioAsync("Session Context Query", async () =>
+    {
+        using var conn = new SnowflakeDbConnection { ConnectionString = ResolveBaseConnectionString() };
+        await conn.OpenAsync();
+
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT CURRENT_USER(), CURRENT_ROLE(), CURRENT_WAREHOUSE(), CURRENT_DATABASE(), CURRENT_SCHEMA()";
+
+        using var reader = await cmd.ExecuteReaderAsync();
+        if (await reader.ReadAsync())
+        {
+            return $"User={reader.GetString(0)}, Role={reader.GetString(1)}, Warehouse={reader.GetString(2)}, DB={reader.GetString(3)}, Schema={reader.GetString(4)}";
+        }
+
+        return "Connected but could not read session context.";
+    });
+
+    private async Task TestCortexAsync() => await RunScenarioAsync("Cortex Query", async () =>
+    {
+        using var conn = new SnowflakeDbConnection { ConnectionString = ResolveBaseConnectionString() };
+        await conn.OpenAsync();
+
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', 'Reply with exactly: CORTEX_OK')";
+        object response = await cmd.ExecuteScalarAsync();
+        return $"Cortex response: {response}";
+    });
+
+    private async Task TestParallelConnectionsAsync() => await RunScenarioAsync("Parallel Connection Test", async () =>
+    {
+        if (UsesInteractiveAuthenticator(ResolveBaseConnectionString()))
+        {
+            throw new InvalidOperationException("Parallel test is disabled for interactive SSO (externalbrowser/IdP URL). Use non-interactive auth (OAuth/JWT/password) for parallel runs.");
+        }
+
+        var tasks = Enumerable.Range(1, 5).Select(async i =>
+        {
+            using var conn = new SnowflakeDbConnection { ConnectionString = ResolveBaseConnectionString() };
+            await conn.OpenAsync();
+
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT CURRENT_TIMESTAMP()";
+            object ts = await cmd.ExecuteScalarAsync();
+            return $"Task {i}: OK ({ts})";
+        });
+
+        var results = await Task.WhenAll(tasks);
+        return string.Join(Environment.NewLine, results);
+    });
+
+    private async Task TestExportWriteAsync() => await RunScenarioAsync("Exports Write Test", async () =>
+    {
+        string exportsPath = Path.Combine(Env.WebRootPath, "Exports");
+        Directory.CreateDirectory(exportsPath);
+
+        string testFile = Path.Combine(exportsPath, $"avd_write_test_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
+        await File.WriteAllTextAsync(testFile, "Write test from Snowflake lab page.");
+
+        var info = new FileInfo(testFile);
+        return $"File write OK: {testFile}{Environment.NewLine}Size: {info.Length} bytes";
+    });
+
+    private async Task InspectConfigAsync() => await RunScenarioAsync("Configuration Summary", () =>
+    {
+        string conn = ResolveBaseConnectionString();
+        var keys = conn.Split(';', StringSplitOptions.RemoveEmptyEntries)
+            .Select(p => p.Split('=', 2))
+            .Where(p => p.Length == 2)
+            .Select(p => $"{p[0].Trim()}={(p[0].Trim().Equals("password", StringComparison.OrdinalIgnoreCase) || p[0].Trim().Equals("token", StringComparison.OrdinalIgnoreCase) ? "***" : p[1].Trim())}")
+            .ToList();
+
+        string lines = $"WebRootPath: {Env.WebRootPath}{Environment.NewLine}Exports: {Path.Combine(Env.WebRootPath, "Exports")}{Environment.NewLine}{Environment.NewLine}Connection Settings:{Environment.NewLine}{string.Join(Environment.NewLine, keys)}";
+        return Task.FromResult(lines);
+    });
+
+    private async Task RunScenarioAsync(string name, Func<Task<string>> action)
+    {
+        isRunning = true;
+        resultLog = $"[{DateTime.Now:HH:mm:ss}] Running: {name}...";
+
+        try
+        {
+            string output = await action();
+            resultLog = $"[{DateTime.Now:HH:mm:ss}] {name}: SUCCESS{Environment.NewLine}{output}";
+        }
+        catch (Exception ex)
+        {
+            resultLog = $"[{DateTime.Now:HH:mm:ss}] {name}: FAILED{Environment.NewLine}{ex.Message}";
+        }
+        finally
+        {
+            isRunning = false;
+        }
+    }
+
+    private string ResolveBaseConnectionString()
+    {
+        string conn = Config["Snowflake:ConnectionString"];
+        if (!string.IsNullOrWhiteSpace(conn))
+        {
+            return conn;
+        }
+
+        var parts = new List<string>
+        {
+            BuildPair("account", Config["Snowflake:Account"]),
+            BuildPair("user", Config["Snowflake:User"]),
+            BuildPair("password", Config["Snowflake:Password"]),
+            BuildPair("authenticator", Config["Snowflake:Authenticator"]),
+            BuildPair("db", Config["Snowflake:Database"]),
+            BuildPair("schema", Config["Snowflake:Schema"]),
+            BuildPair("warehouse", Config["Snowflake:Warehouse"]),
+            BuildPair("role", Config["Snowflake:Role"])
+        }
+        .Where(x => !string.IsNullOrWhiteSpace(x));
+
+        return string.Join(";", parts);
+    }
+
+    private static string BuildPair(string key, string value)
+        => string.IsNullOrWhiteSpace(value) ? string.Empty : $"{key}={value}";
+
+    private static string Upsert(string connectionString, string key, string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return connectionString;
+        }
+
+        var map = ParseConnectionString(connectionString);
+        map[key] = value;
+        return ToConnectionString(map);
+    }
+
+    private static string Remove(string connectionString, string key)
+    {
+        var map = ParseConnectionString(connectionString);
+        map.Remove(key);
+        return ToConnectionString(map);
+    }
+
+    private static Dictionary<string, string> ParseConnectionString(string connectionString)
+    {
+        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var piece in connectionString.Split(';', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var idx = piece.IndexOf('=');
+            if (idx <= 0) continue;
+            var k = piece[..idx].Trim();
+            var v = piece[(idx + 1)..].Trim();
+            map[k] = v;
+        }
+
+        return map;
+    }
+
+    private static string ToConnectionString(Dictionary<string, string> map)
+    {
+        return string.Join(";", map.Select(kvp => $"{kvp.Key}={kvp.Value}"));
+    }
+
+    private static bool UsesInteractiveAuthenticator(string connectionString)
+    {
+        var map = ParseConnectionString(connectionString);
+        if (!map.TryGetValue("authenticator", out var authenticator) || string.IsNullOrWhiteSpace(authenticator))
+        {
+            return false;
+        }
+
+        return authenticator.Equals("externalbrowser", StringComparison.OrdinalIgnoreCase)
+            || authenticator.StartsWith("https://", StringComparison.OrdinalIgnoreCase);
+    }
+}
